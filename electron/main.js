@@ -23,7 +23,12 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
     },
-    titleBarStyle: 'hiddenInset',
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      height: 28,
+      color: '#11111b',
+      symbolColor: '#cdd6f4',
+    },
     show: false,
   });
 

@@ -115,6 +115,11 @@ export default function Mindmap({
   const astRef = useRef<any>(null);
   const mindmapRootRef = useRef<MindmapNode | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fitFrameRef = useRef<number | null>(null);
+  const pendingFitFilePathRef = useRef<string | null>(null);
+  const pendingAutoFitFilePathRef = useRef<string | null>(null);
+  const lastFittedFilePathRef = useRef<string | null>(null);
+  const [, forceReadyRender] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
 
   const activeProjectId = useAppStore(s => s.activeProjectId);
@@ -140,6 +145,25 @@ export default function Mindmap({
     }, 500);
   }, [activeProjectId, activeFilePath, updateFileContent, saveFile]);
 
+  const scheduleFit = useCallback((filePath: string) => {
+    const me = meRef.current;
+    if (!me) return;
+    pendingFitFilePathRef.current = filePath;
+    if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
+    fitFrameRef.current = requestAnimationFrame(() => {
+      fitFrameRef.current = requestAnimationFrame(() => {
+        if (pendingFitFilePathRef.current === filePath) {
+          meRef.current?.scaleFit();
+          lastFittedFilePathRef.current = filePath;
+          pendingAutoFitFilePathRef.current = null;
+          forceReadyRender(v => v + 1);
+          pendingFitFilePathRef.current = null;
+        }
+        fitFrameRef.current = null;
+      });
+    });
+  }, []);
+
   const handleOperation = useCallback((op: MindmapOperation) => {
     if (!astRef.current || !mindmapRootRef.current || !activeFilePath) return;
     const newAst = applyMindmapOperation(astRef.current, mindmapRootRef.current, op);
@@ -148,7 +172,7 @@ export default function Mindmap({
     syncToFile(newContent);
   }, [activeFilePath, syncToFile]);
 
-  const rebuildMindmap = useCallback((content: string) => {
+  const rebuildMindmap = useCallback((content: string, shouldAutoFit: boolean) => {
     if (!containerRef.current) return;
     try {
       const ast = parseMarkdown(content);
@@ -253,22 +277,33 @@ export default function Mindmap({
       });
 
       meRef.current = me;
+
+      if (shouldAutoFit) {
+        pendingAutoFitFilePathRef.current = activeFilePath || null;
+        scheduleFit(activeFilePath || '');
+      }
     } catch (err) {
+      pendingAutoFitFilePathRef.current = null;
       console.error('Failed to build mindmap:', err);
     }
-  }, [fileName, handleOperation, onMindmapRoot, onSelectNode, orthogonalMainBranch, orthogonalSubBranch, themeSpacing]);
+  }, [fileName, handleOperation, onMindmapRoot, onSelectNode, orthogonalMainBranch, orthogonalSubBranch, scheduleFit, themeSpacing]);
 
   useEffect(() => {
     if (activeFile?.content !== undefined) {
-      rebuildMindmap(activeFile.content);
+      const shouldAutoFit = activeFilePath !== lastFittedFilePathRef.current;
+      rebuildMindmap(activeFile.content, shouldAutoFit);
     }
-    return () => {
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    };
-  }, [activeFile?.content, rebuildMindmap]);
+  }, [activeFile?.content, activeFilePath, rebuildMindmap]);
 
   useEffect(() => {
     return () => {
+      if (fitFrameRef.current !== null) {
+        cancelAnimationFrame(fitFrameRef.current);
+        fitFrameRef.current = null;
+      }
+      pendingFitFilePathRef.current = null;
+      pendingAutoFitFilePathRef.current = null;
+      lastFittedFilePathRef.current = null;
       if (meRef.current) {
         meRef.current.destroy();
         meRef.current = null;
@@ -284,6 +319,12 @@ export default function Mindmap({
       </div>
     );
   }
+
+  const shouldHideMindmap = activeFilePath !== null
+    && (
+      activeFilePath === pendingAutoFitFilePathRef.current
+      || activeFilePath !== lastFittedFilePathRef.current
+    );
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
@@ -336,7 +377,14 @@ export default function Mindmap({
           }
         }}>导出</button>
       </div>
-      <div className="mindmap-container" ref={containerRef} />
+      <div
+        className="mindmap-container"
+        ref={containerRef}
+        style={{
+          visibility: shouldHideMindmap ? 'hidden' : 'visible',
+          pointerEvents: shouldHideMindmap ? 'none' : 'auto',
+        }}
+      />
     </div>
   );
 }

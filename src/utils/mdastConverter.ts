@@ -205,18 +205,13 @@ function convertListToNodes(listNode: any, depth: number): MindmapNode[] {
 
 function extractText(node: any): string {
   let text = '';
-  visit(node, 'text', (n: any) => {
-    text += n.value;
+  // 同时保留普通文本与行内代码（如 `_docs/`），并按其在源中的顺序拼接。
+  // 注意：行内代码原样保留内容即可——mind-elixir 用 textContent 渲染节点，
+  // 下划线不会被当作斜体语法吞噬。链接文本会被 visit 自然递归捕获。
+  visit(node, (n: any) => {
+    if (n.type === 'text') text += n.value;
+    else if (n.type === 'inlineCode') text += n.value;
   });
-  if (!text) {
-    visit(node, (n: any) => {
-      if (n.type === 'inlineCode') text += n.value;
-      if (n.type === 'link') {
-        const linkText = extractText(n);
-        if (linkText) text += linkText;
-      }
-    });
-  }
   return text || '';
 }
 
