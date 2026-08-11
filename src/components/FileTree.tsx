@@ -43,8 +43,8 @@ function TreeNode({ node, projectId, depth, collapseSignal }: {
           <span className="tree-folder-icon">{expanded ? '📂' : '📁'}</span>
           <span className="tree-label">{node.name}</span>
         </div>
-        {expanded && node.children && (
-          <div className="tree-children">
+        {node.children && node.children.length > 0 && (
+          <div className={`tree-children ${expanded ? 'expanded' : 'collapsed'}`} aria-hidden={!expanded}>
             {node.children.map(child => (
               <TreeNode key={child.path} node={child} projectId={projectId} depth={depth + 1} collapseSignal={collapseSignal} />
             ))}
