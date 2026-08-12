@@ -920,6 +920,12 @@ body {
   font-weight: 700;
 }
 
+.file-tab-conflict {
+  color: var(--warning);
+  font-size: 10px;
+  font-weight: 700;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -1042,6 +1048,65 @@ body {
   background: var(--accent);
   width: 3px !important;
   margin-left: 3px;
+}
+
+/* --- Context Menu --- */
+.context-menu {
+  position: fixed;
+  z-index: 10003;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  min-width: 140px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  animation: context-menu-in 0.12s ease;
+}
+
+@keyframes context-menu-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.context-menu-item {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 4px;
+  white-space: nowrap;
+  transition: all 0.1s;
+}
+
+.context-menu-item:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.context-menu-item.disabled {
+  color: var(--text-muted);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.context-menu-item.disabled:hover {
+  background: none;
+  color: var(--text-muted);
+}
+
+.context-menu-item.danger {
+  color: var(--danger);
+}
+
+.context-menu-item.danger:hover {
+  background: var(--danger);
+  color: var(--bg-primary);
+}
+
+.context-menu-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 8px;
 }
 
 /* --- Mind Elixir (themed via DARK_THEME + cssVar, node type via nodeData.style) --- */

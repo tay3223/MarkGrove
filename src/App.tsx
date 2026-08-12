@@ -67,8 +67,12 @@ export default function App() {
       // Cmd/Ctrl+Shift+S - Save All
       if (mod && e.shiftKey && e.key === 'S') {
         e.preventDefault();
-        saveAllFiles().then(() => {
-          showToast({ type: 'success', message: '全部已保存', duration: 1500 });
+        saveAllFiles().then(({ succeeded, failed }) => {
+          if (failed === 0) {
+            showToast({ type: 'success', message: '全部已保存', duration: 1500 });
+          } else {
+            showToast({ type: 'warning', message: `保存完成: ${succeeded} 成功, ${failed} 失败` });
+          }
         });
       }
 
@@ -103,7 +107,7 @@ export default function App() {
     e.stopPropagation();
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     const files = e.dataTransfer.files;
@@ -113,8 +117,8 @@ export default function App() {
       if (filePath) {
         // Check if it's a markdown file
         if (/\.(md|markdown|mdown|mkd)$/i.test(filePath)) {
-          // Open as single file
-          const dirPath = filePath.substring(0, filePath.lastIndexOf('/'));
+          // Use IPC for platform-independent directory extraction
+          const dirPath = await window.api.getDirName(filePath);
           const existing = projects.find(p => p.path === dirPath);
           if (existing) {
             useAppStore.getState().openFile(existing.id, filePath);

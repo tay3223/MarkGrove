@@ -74,6 +74,22 @@ function TreeNode({ node, projectId, depth, collapseSignal }: {
   );
 }
 
+/** Pure function: deduplicate nodes without mutating the original tree */
+function deduplicateNodes(nodes: FileNode[]): FileNode[] {
+  const seen = new Set<string>();
+  const result: FileNode[] = [];
+  for (const node of nodes) {
+    if (seen.has(node.path)) continue;
+    seen.add(node.path);
+    if (node.children) {
+      result.push({ ...node, children: deduplicateNodes(node.children) });
+    } else {
+      result.push(node);
+    }
+  }
+  return result;
+}
+
 export default function FileTree() {
   const activeProjectId = useAppStore(s => s.activeProjectId);
   const projects = useAppStore(s => s.projects);
@@ -107,7 +123,7 @@ export default function FileTree() {
         </button>
       </div>
       <div className="file-tree-content">
-        {project.fileTree.map(node => (
+        {deduplicateNodes(project.fileTree).map(node => (
           <TreeNode key={node.path} node={node} projectId={project.id} depth={0} collapseSignal={collapseSignal} />
         ))}
       </div>

@@ -6,9 +6,14 @@ const Store = require('electron-store');
 const chokidar = require('chokidar');
 
 const store = new Store({ name: 'markgrove-session' });
+const snapshotStore = new Store({ name: 'markgrove-snapshots' });
 
 const isDev = process.env.NODE_ENV === 'development';
 const watchers = new Map();
+
+// Track files we recently wrote ourselves to suppress watcher events
+const recentWrites = new Map(); // filePath -> timestamp
+const SELF_WRITE_SUPPRESS_MS = 1500;
 
 let mainWindow = null;
 let allowClose = false;
@@ -107,6 +112,11 @@ function startWatcher(projectPath) {
   });
   watcher.on('all', (event, filePath) => {
     if (!isMarkdownFile(filePath)) return;
+    // Suppress events from our own writes
+    const writeTime = recentWrites.get(filePath);
+    if (writeTime && (Date.now() - writeTime) < SELF_WRITE_SUPPRESS_MS) {
+      return;
+    }
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('file-changed', { event, path: filePath, projectPath });
     }
@@ -129,6 +139,19 @@ function isPathInProject(filePath) {
     }
   }
   return false;
+}
+
+function markSelfWrite(filePath) {
+  recentWrites.set(filePath, Date.now());
+  // Clean up old entries periodically
+  if (recentWrites.size > 100) {
+    const now = Date.now();
+    for (const [p, t] of recentWrites) {
+      if (now - t > SELF_WRITE_SUPPRESS_MS * 2) {
+        recentWrites.delete(p);
+      }
+    }
+  }
 }
 
 app.whenReady().then(() => {
@@ -194,6 +217,7 @@ ipcMain.handle('write-file', async (_event, filePath, content) => {
     if (!isPathInProject(filePath)) {
       return { error: '文件路径不在已打开的项目目录内' };
     }
+    markSelfWrite(filePath);
     await fs.writeFile(filePath, content, 'utf-8');
     const stat = await fs.stat(filePath);
     return { success: true, mtime: stat.mtimeMs };
@@ -203,24 +227,41 @@ ipcMain.handle('write-file', async (_event, filePath, content) => {
 });
 
 ipcMain.handle('write-file-atomic', async (_event, filePath, content) => {
+  const tmpPath = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.tmp-${Date.now()}`
+  );
   try {
     if (!isPathInProject(filePath)) {
       return { error: '文件路径不在已打开的项目目录内' };
     }
-    const dir = path.dirname(filePath);
-    const base = path.basename(filePath);
-    const tmpPath = path.join(dir, `.${base}.tmp-${Date.now()}`);
+    // Preserve original file permissions
+    let mode;
+    try {
+      const origStat = await fs.stat(filePath);
+      mode = origStat.mode;
+    } catch { /* file may not exist yet */ }
+
+    markSelfWrite(filePath);
     await fs.writeFile(tmpPath, content, 'utf-8');
+    if (mode !== undefined) {
+      await fs.chmod(tmpPath, mode);
+    }
     await fs.rename(tmpPath, filePath);
     const stat = await fs.stat(filePath);
     return { success: true, mtime: stat.mtimeMs };
   } catch (err) {
+    // Clean up temp file on failure
+    try { await fs.unlink(tmpPath); } catch { /* ignore */ }
     return { error: err.message };
   }
 });
 
 ipcMain.handle('get-file-mtime', async (_event, filePath) => {
   try {
+    if (!isPathInProject(filePath)) {
+      return { error: '文件路径不在已打开的项目目录内' };
+    }
     const stat = await fs.stat(filePath);
     return { mtime: stat.mtimeMs };
   } catch (err) {
@@ -250,4 +291,18 @@ ipcMain.handle('get-project-name', (_event, projectPath) => {
 
 ipcMain.handle('show-item-in-folder', (_event, filePath) => {
   shell.showItemInFolder(filePath);
+});
+
+ipcMain.handle('get-dir-name', (_event, filePath) => {
+  return path.dirname(filePath);
+});
+
+// Snapshot persistence
+ipcMain.handle('get-snapshots', () => {
+  return snapshotStore.get('snapshots', []);
+});
+
+ipcMain.handle('save-snapshots', (_event, snapshots) => {
+  // Keep only the latest 50 snapshots
+  snapshotStore.set('snapshots', snapshots.slice(-50));
 });

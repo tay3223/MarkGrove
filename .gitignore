@@ -10,4 +10,4 @@ output/
 .env.*
 !.env.example
 _issues
-
+.qoder

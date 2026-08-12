@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
+import remarkFrontmatter from 'remark-frontmatter';
 import remarkRehype from 'remark-rehype';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeStringify from 'rehype-stringify';
@@ -22,6 +23,7 @@ export default function Preview() {
     try {
       const result = unified()
         .use(remarkParse)
+        .use(remarkFrontmatter, ['yaml'])
         .use(remarkGfm)
         .use(remarkRehype)
         .use(rehypeHighlight)

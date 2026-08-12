@@ -20,8 +20,9 @@ export interface OpenFile {
   savedContent?: string;
   lastSavedAt?: number;
   diskMtime?: number;
-  saveState?: 'saved' | 'saving' | 'error';
+  saveState?: 'saved' | 'saving' | 'error' | 'conflict';
   saveError?: string;
+  conflictState?: 'external-modified' | null;
 }
 
 export type ViewTab = 'source' | 'preview' | 'mindmap';
@@ -52,7 +53,7 @@ export interface MindmapNode {
     sourcePosition?: any;
     codeContent?: string;
     codeLang?: string;
-    nodeType?: 'heading' | 'list' | 'code' | 'root' | 'table' | 'image' | 'html' | 'thematicBreak' | 'footnote' | 'unknown';
+    nodeType?: 'heading' | 'list' | 'code' | 'root' | 'table' | 'image' | 'html' | 'thematicBreak' | 'footnote' | 'frontmatter' | 'unknown';
     headingLevel?: number;
     description?: string;
     firstLine?: string;
@@ -83,9 +84,21 @@ export interface FileSnapshot {
 
 export interface UndoEntry {
   filePath: string;
+  projectId: string;
   content: string;
   timestamp: number;
   source: 'source' | 'mindmap';
+}
+
+/** Pending source position for mindmap→source navigation */
+export interface SourcePositionRequest {
+  filePath: string;
+  projectId: string;
+  startLine: number;
+  endLine: number;
+  startColumn?: number;
+  endColumn?: number;
+  nodeId?: string;
 }
 
 declare global {
@@ -104,6 +117,9 @@ declare global {
       saveSession: (session: SessionState) => Promise<void>;
       getProjectName: (path: string) => Promise<string>;
       showItemInFolder: (path: string) => Promise<void>;
+      getDirName: (path: string) => Promise<string>;
+      getSnapshots: () => Promise<FileSnapshot[]>;
+      saveSnapshots: (snapshots: FileSnapshot[]) => Promise<void>;
       onFileChanged: (callback: (data: FileChangedEvent) => void) => void;
       removeFileChangedListener: () => void;
       onBeforeClose: (callback: () => Promise<boolean>) => void;

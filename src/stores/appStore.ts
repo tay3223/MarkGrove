@@ -1,10 +1,11 @@
 import { create } from 'zustand';
-import type { Project, OpenFile, FileNode, ViewTab, SessionState, UndoEntry, FileSnapshot } from '../types';
+import type { Project, OpenFile, FileNode, ViewTab, SessionState, UndoEntry, FileSnapshot, SourcePositionRequest } from '../types';
 import { showToast } from '../components/Toast';
 
 const MAX_UNDO_STEPS = 50;
 const MAX_SNAPSHOTS = 20;
 const SNAPSHOT_INTERVAL = 30000; // 30 seconds
+const UNDO_MERGE_WINDOW = 1000; // 1 second - merge rapid consecutive edits
 
 interface AppState {
   projects: Project[];
@@ -13,10 +14,11 @@ interface AppState {
   activeFilePath: Record<string, string | null>;
   activeTab: ViewTab;
   initialized: boolean;
-  undoStack: UndoEntry[];
-  redoStack: UndoEntry[];
+  undoStacks: Record<string, UndoEntry[]>; // keyed by filePath
+  redoStacks: Record<string, UndoEntry[]>; // keyed by filePath
   snapshots: FileSnapshot[];
   lastSnapshotTime: number;
+  pendingSourcePosition: SourcePositionRequest | null;
 
   initFromSession: () => Promise<void>;
   addProject: () => Promise<void>;
@@ -29,8 +31,8 @@ interface AppState {
   setActiveTab: (tab: ViewTab) => void;
   updateFileContent: (projectId: string, filePath: string, content: string, source?: 'source' | 'mindmap') => void;
   markFileDirty: (projectId: string, filePath: string, dirty: boolean) => void;
-  saveFile: (projectId: string, filePath: string) => Promise<boolean>;
-  saveAllFiles: () => Promise<void>;
+  saveFile: (projectId: string, filePath: string, force?: boolean) => Promise<boolean>;
+  saveAllFiles: () => Promise<{ succeeded: number; failed: number }>;
   refreshFileTree: (projectId: string) => Promise<void>;
   handleExternalFileChange: (filePath: string, projectPath: string) => Promise<void>;
   saveSession: () => Promise<void>;
@@ -40,6 +42,10 @@ interface AppState {
   canRedo: () => boolean;
   takeSnapshot: (filePath: string, content: string) => void;
   flushAllSaves: () => Promise<void>;
+  resolveConflict: (projectId: string, filePath: string, resolution: 'keep-local' | 'use-external') => Promise<void>;
+  requestSourcePosition: (req: SourcePositionRequest) => void;
+  clearSourcePosition: () => void;
+  restoreSnapshot: (snapshot: FileSnapshot) => void;
 }
 
 function generateId(): string {
@@ -58,14 +64,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeFilePath: {},
   activeTab: 'mindmap',
   initialized: false,
-  undoStack: [],
-  redoStack: [],
+  undoStacks: {},
+  redoStacks: {},
   snapshots: [],
   lastSnapshotTime: 0,
+  pendingSourcePosition: null,
 
   initFromSession: async () => {
     try {
       const session = await window.api.getSession();
+      // Load persisted snapshots
+      try {
+        const savedSnapshots = await window.api.getSnapshots();
+        if (Array.isArray(savedSnapshots)) {
+          set({ snapshots: savedSnapshots });
+        }
+      } catch { /* ignore snapshot load errors */ }
+
       if (session && session.projects.length > 0) {
         const projects: Project[] = [];
         const failedPaths: string[] = [];
@@ -97,10 +112,11 @@ export const useAppStore = create<AppState>((set, get) => ({
           activeTab: session.activeTab || 'mindmap',
           initialized: true,
         });
-        // Re-open files from session
+        // Re-open files from session (deduplicate paths)
         const failedFiles: string[] = [];
         for (const [pid, filePaths] of Object.entries(session.openFiles)) {
-          for (const fp of filePaths) {
+          const uniquePaths = [...new Set(filePaths)];
+          for (const fp of uniquePaths) {
             try {
               await get().openFile(pid, fp);
             } catch {
@@ -156,8 +172,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const filePath = await window.api.openFileDialog();
       if (!filePath) return;
-      // Create a temporary project for the single file
-      const dirPath = filePath.substring(0, filePath.lastIndexOf('/'));
+      // Use IPC for platform-independent directory extraction
+      const dirPath = await window.api.getDirName(filePath);
       const existing = get().projects.find(p => p.path === dirPath);
       if (existing) {
         await get().openFile(existing.id, filePath);
@@ -237,13 +253,22 @@ export const useAppStore = create<AppState>((set, get) => ({
         diskMtime: result.mtime,
         saveState: 'saved',
       };
-      set(s => ({
-        openFiles: {
-          ...s.openFiles,
-          [projectId]: [...(s.openFiles[projectId] || []), file],
-        },
-        activeFilePath: { ...s.activeFilePath, [projectId]: filePath },
-      }));
+      set(s => {
+        // Double-check: avoid adding duplicate file entries
+        const currentFiles = s.openFiles[projectId] || [];
+        if (currentFiles.some(f => f.path === filePath)) {
+          return {
+            activeFilePath: { ...s.activeFilePath, [projectId]: filePath },
+          };
+        }
+        return {
+          openFiles: {
+            ...s.openFiles,
+            [projectId]: [...currentFiles, file],
+          },
+          activeFilePath: { ...s.activeFilePath, [projectId]: filePath },
+        };
+      });
       get().saveSession();
     } catch (err: any) {
       showToast({ type: 'error', message: '打开文件失败', detail: err?.message });
@@ -280,27 +305,47 @@ export const useAppStore = create<AppState>((set, get) => ({
     const file = get().openFiles[projectId]?.find(f => f.path === filePath);
     if (!file) return;
 
-    // Push to undo stack before modifying
+    // Push to per-file undo stack, merging rapid consecutive edits
     if (file.content !== content) {
-      set(s => ({
-        undoStack: [...s.undoStack.slice(-MAX_UNDO_STEPS + 1), {
-          filePath,
-          content: file.content,
-          timestamp: Date.now(),
-          source,
-        }],
-        redoStack: [],
-      }));
-    }
+      set(s => {
+        const fileUndoStack = s.undoStacks[filePath] || [];
+        const lastEntry = fileUndoStack[fileUndoStack.length - 1];
+        const now = Date.now();
 
-    set(s => ({
-      openFiles: {
-        ...s.openFiles,
-        [projectId]: (s.openFiles[projectId] || []).map(f =>
-          f.path === filePath ? { ...f, content, isDirty: true, saveState: undefined, saveError: undefined } : f
-        ),
-      },
-    }));
+        // Merge if last edit was very recent and from same source
+        if (lastEntry && (now - lastEntry.timestamp) < UNDO_MERGE_WINDOW && lastEntry.source === source) {
+          // Just update the content in the file, don't push new undo entry
+          return {
+            openFiles: {
+              ...s.openFiles,
+              [projectId]: (s.openFiles[projectId] || []).map(f =>
+                f.path === filePath ? { ...f, content, isDirty: true, saveState: undefined, saveError: undefined, conflictState: undefined } : f
+              ),
+            },
+          };
+        }
+
+        return {
+          undoStacks: {
+            ...s.undoStacks,
+            [filePath]: [...fileUndoStack.slice(-MAX_UNDO_STEPS + 1), {
+              filePath,
+              projectId,
+              content: file.content,
+              timestamp: now,
+              source,
+            }],
+          },
+          redoStacks: { ...s.redoStacks, [filePath]: [] },
+          openFiles: {
+            ...s.openFiles,
+            [projectId]: (s.openFiles[projectId] || []).map(f =>
+              f.path === filePath ? { ...f, content, isDirty: true, saveState: undefined, saveError: undefined, conflictState: undefined } : f
+            ),
+          },
+        };
+      });
+    }
 
     // Auto-snapshot periodically
     const now = Date.now();
@@ -321,15 +366,51 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
   },
 
-  saveFile: async (projectId, filePath) => {
+  saveFile: async (projectId, filePath, force = false) => {
     const file = get().openFiles[projectId]?.find(f => f.path === filePath);
     if (!file) return false;
 
-    // Check for external modification
-    if (file.diskMtime) {
+    // If in conflict state and not forcing, block the save
+    if (file.conflictState === 'external-modified' && !force) {
+      return false;
+    }
+
+    // Check for external modification before saving dirty files
+    if (file.isDirty && file.diskMtime && !force) {
       const mtimeResult = await window.api.getFileMtime(filePath);
-      if (mtimeResult.mtime && mtimeResult.mtime > file.diskMtime && !file.isDirty) {
-        // File was externally modified and we have no local changes - just reload
+      if (mtimeResult.mtime && mtimeResult.mtime > file.diskMtime) {
+        // External modification detected - enter conflict state
+        set(s => ({
+          openFiles: {
+            ...s.openFiles,
+            [projectId]: (s.openFiles[projectId] || []).map(f =>
+              f.path === filePath ? { ...f, saveState: 'conflict' as const, conflictState: 'external-modified' as const } : f
+            ),
+          },
+        }));
+        showToast({
+          type: 'warning',
+          message: `文件冲突: ${getFileName(filePath)}`,
+          detail: '磁盘上的文件已被外部修改，保存已被阻止',
+          actions: [
+            {
+              label: '强制保存',
+              onClick: () => { get().saveFile(projectId, filePath, true); },
+            },
+            {
+              label: '采用磁盘版本',
+              onClick: () => { get().resolveConflict(projectId, filePath, 'use-external'); },
+            },
+          ],
+        });
+        return false;
+      }
+    }
+
+    // If not dirty and no external change, just reload
+    if (!file.isDirty && file.diskMtime) {
+      const mtimeResult = await window.api.getFileMtime(filePath);
+      if (mtimeResult.mtime && mtimeResult.mtime > file.diskMtime) {
         const readResult = await window.api.readFile(filePath);
         if (!readResult.error) {
           set(s => ({
@@ -350,7 +431,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       openFiles: {
         ...s.openFiles,
         [projectId]: (s.openFiles[projectId] || []).map(f =>
-          f.path === filePath ? { ...f, saveState: 'saving' as const } : f
+          f.path === filePath ? { ...f, saveState: 'saving' as const, conflictState: null } : f
         ),
       },
     }));
@@ -395,6 +476,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               diskMtime: result.mtime,
               saveState: 'saved' as const,
               saveError: undefined,
+              conflictState: null,
             } : f
           ),
         },
@@ -438,7 +520,16 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       }
     }
-    await Promise.all(promises);
+    const results = await Promise.all(promises);
+    const succeeded = results.filter(Boolean).length;
+    const failed = results.filter(r => !r).length;
+    if (failed > 0) {
+      showToast({
+        type: 'warning',
+        message: `保存完成: ${succeeded} 成功, ${failed} 失败`,
+      });
+    }
+    return { succeeded, failed };
   },
 
   refreshFileTree: async (projectId) => {
@@ -479,34 +570,62 @@ export const useAppStore = create<AppState>((set, get) => ({
         // Silently fail
       }
     } else if (openFile && openFile.isDirty) {
-      // External change detected on dirty file - notify user
+      // External change detected on dirty file - enter conflict state
+      set(s => ({
+        openFiles: {
+          ...s.openFiles,
+          [project.id]: (s.openFiles[project.id] || []).map(f =>
+            f.path === filePath ? { ...f, saveState: 'conflict' as const, conflictState: 'external-modified' as const } : f
+          ),
+        },
+      }));
       showToast({
         type: 'warning',
-        message: `文件被外部修改: ${getFileName(filePath)}`,
-        detail: '当前有未保存的修改，外部修改已被检测',
+        message: `文件冲突: ${getFileName(filePath)}`,
+        detail: '磁盘上的文件已被外部修改，自动保存已暂停',
         actions: [
           {
-            label: '保留本地',
-            onClick: () => { /* keep local, do nothing */ },
+            label: '保留本地并强制保存',
+            onClick: () => { get().resolveConflict(project.id, filePath, 'keep-local'); },
           },
           {
-            label: '采用外部',
-            onClick: async () => {
-              const result = await window.api.readFile(filePath);
-              if (!result.error) {
-                set(s => ({
-                  openFiles: {
-                    ...s.openFiles,
-                    [project.id]: (s.openFiles[project.id] || []).map(f =>
-                      f.path === filePath ? { ...f, content: result.content!, savedContent: result.content!, isDirty: false, diskMtime: result.mtime } : f
-                    ),
-                  },
-                }));
-              }
-            },
+            label: '采用磁盘版本',
+            onClick: () => { get().resolveConflict(project.id, filePath, 'use-external'); },
           },
         ],
       });
+    }
+  },
+
+  resolveConflict: async (projectId, filePath, resolution) => {
+    if (resolution === 'use-external') {
+      const result = await window.api.readFile(filePath);
+      if (!result.error) {
+        set(s => ({
+          openFiles: {
+            ...s.openFiles,
+            [projectId]: (s.openFiles[projectId] || []).map(f =>
+              f.path === filePath ? {
+                ...f,
+                content: result.content!,
+                savedContent: result.content!,
+                isDirty: false,
+                diskMtime: result.mtime,
+                saveState: 'saved' as const,
+                saveError: undefined,
+                conflictState: null,
+              } : f
+            ),
+          },
+        }));
+        showToast({ type: 'info', message: `已加载磁盘版本: ${getFileName(filePath)}` });
+      }
+    } else {
+      // keep-local: force save
+      const success = await get().saveFile(projectId, filePath, true);
+      if (success) {
+        showToast({ type: 'success', message: `已强制保存: ${getFileName(filePath)}` });
+      }
     }
   },
 
@@ -533,66 +652,126 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   undo: () => {
     const s = get();
-    if (s.undoStack.length === 0) return;
-    const entry = s.undoStack[s.undoStack.length - 1];
-    const currentFile = Object.values(s.openFiles).flat().find(f => f.path === entry.filePath);
+    const pid = s.activeProjectId;
+    if (!pid) return;
+    const fp = s.activeFilePath[pid];
+    if (!fp) return;
+
+    const fileUndoStack = s.undoStacks[fp] || [];
+    if (fileUndoStack.length === 0) return;
+    const entry = fileUndoStack[fileUndoStack.length - 1];
+    const currentFile = s.openFiles[entry.projectId]?.find(f => f.path === entry.filePath);
     if (!currentFile) return;
 
     set(s2 => ({
-      undoStack: s2.undoStack.slice(0, -1),
-      redoStack: [...s2.redoStack, {
-        filePath: entry.filePath,
-        content: currentFile.content,
-        timestamp: Date.now(),
-        source: entry.source,
-      }],
-      openFiles: Object.fromEntries(
-        Object.entries(s2.openFiles).map(([pid, files]) => [
-          pid,
-          files.map(f => f.path === entry.filePath ? { ...f, content: entry.content, isDirty: true } : f),
-        ])
-      ),
+      undoStacks: { ...s2.undoStacks, [fp]: (s2.undoStacks[fp] || []).slice(0, -1) },
+      redoStacks: {
+        ...s2.redoStacks,
+        [fp]: [...(s2.redoStacks[fp] || []), {
+          filePath: entry.filePath,
+          projectId: entry.projectId,
+          content: currentFile.content,
+          timestamp: Date.now(),
+          source: entry.source,
+        }],
+      },
+      openFiles: {
+        ...s2.openFiles,
+        [entry.projectId]: (s2.openFiles[entry.projectId] || []).map(f =>
+          f.path === entry.filePath ? { ...f, content: entry.content, isDirty: true } : f
+        ),
+      },
     }));
   },
 
   redo: () => {
     const s = get();
-    if (s.redoStack.length === 0) return;
-    const entry = s.redoStack[s.redoStack.length - 1];
-    const currentFile = Object.values(s.openFiles).flat().find(f => f.path === entry.filePath);
+    const pid = s.activeProjectId;
+    if (!pid) return;
+    const fp = s.activeFilePath[pid];
+    if (!fp) return;
+
+    const fileRedoStack = s.redoStacks[fp] || [];
+    if (fileRedoStack.length === 0) return;
+    const entry = fileRedoStack[fileRedoStack.length - 1];
+    const currentFile = s.openFiles[entry.projectId]?.find(f => f.path === entry.filePath);
     if (!currentFile) return;
 
     set(s2 => ({
-      redoStack: s2.redoStack.slice(0, -1),
-      undoStack: [...s2.undoStack, {
-        filePath: entry.filePath,
-        content: currentFile.content,
-        timestamp: Date.now(),
-        source: entry.source,
-      }],
-      openFiles: Object.fromEntries(
-        Object.entries(s2.openFiles).map(([pid, files]) => [
-          pid,
-          files.map(f => f.path === entry.filePath ? { ...f, content: entry.content, isDirty: true } : f),
-        ])
-      ),
+      redoStacks: { ...s2.redoStacks, [fp]: (s2.redoStacks[fp] || []).slice(0, -1) },
+      undoStacks: {
+        ...s2.undoStacks,
+        [fp]: [...(s2.undoStacks[fp] || []), {
+          filePath: entry.filePath,
+          projectId: entry.projectId,
+          content: currentFile.content,
+          timestamp: Date.now(),
+          source: entry.source,
+        }],
+      },
+      openFiles: {
+        ...s2.openFiles,
+        [entry.projectId]: (s2.openFiles[entry.projectId] || []).map(f =>
+          f.path === entry.filePath ? { ...f, content: entry.content, isDirty: true } : f
+        ),
+      },
     }));
   },
 
-  canUndo: () => get().undoStack.length > 0,
-  canRedo: () => get().redoStack.length > 0,
+  canUndo: () => {
+    const s = get();
+    const pid = s.activeProjectId;
+    if (!pid) return false;
+    const fp = s.activeFilePath[pid];
+    if (!fp) return false;
+    return (s.undoStacks[fp] || []).length > 0;
+  },
+
+  canRedo: () => {
+    const s = get();
+    const pid = s.activeProjectId;
+    if (!pid) return false;
+    const fp = s.activeFilePath[pid];
+    if (!fp) return false;
+    return (s.redoStacks[fp] || []).length > 0;
+  },
 
   takeSnapshot: (filePath, content) => {
-    set(s => ({
-      snapshots: [...s.snapshots.slice(-MAX_SNAPSHOTS + 1), {
+    set(s => {
+      const newSnapshots = [...s.snapshots.slice(-MAX_SNAPSHOTS + 1), {
         filePath,
         content,
         timestamp: Date.now(),
-      }],
-    }));
+      }];
+      // Persist snapshots
+      window.api.saveSnapshots(newSnapshots).catch(() => {});
+      return { snapshots: newSnapshots };
+    });
+  },
+
+  restoreSnapshot: (snapshot) => {
+    const s = get();
+    const pid = s.activeProjectId;
+    if (!pid) return;
+    // Find the file in open files
+    const file = s.openFiles[pid]?.find(f => f.path === snapshot.filePath);
+    if (file) {
+      get().updateFileContent(pid, snapshot.filePath, snapshot.content, 'source');
+      showToast({ type: 'success', message: `已恢复快照: ${getFileName(snapshot.filePath)}` });
+    } else {
+      showToast({ type: 'warning', message: '文件未打开，无法恢复快照' });
+    }
   },
 
   flushAllSaves: async () => {
     await get().saveAllFiles();
+  },
+
+  requestSourcePosition: (req) => {
+    set({ pendingSourcePosition: req });
+  },
+
+  clearSourcePosition: () => {
+    set({ pendingSourcePosition: null });
   },
 }));

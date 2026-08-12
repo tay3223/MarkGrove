@@ -17,6 +17,8 @@ export default function SourceEditor() {
     const fp = s.activeFilePath[pid];
     return s.openFiles[pid]?.find(f => f.path === fp) ?? null;
   });
+  const pendingSourcePosition = useAppStore(s => s.pendingSourcePosition);
+  const clearSourcePosition = useAppStore(s => s.clearSourcePosition);
 
   const latestRef = useRef<{
     activeProjectId: string | null;
@@ -81,40 +83,47 @@ export default function SourceEditor() {
     }
   }, [activeFile?.path, activeFile?.content]);
 
-  // Listen for mindmap-goto-line events
+  // Consume pending source position from store (mindmap → source navigation)
   useEffect(() => {
-    const handler = (e: Event) => {
-      const customEvent = e as CustomEvent;
-      const { line, endLine } = customEvent.detail;
-      const editor = editorRef.current;
-      if (!editor) return;
+    if (!pendingSourcePosition || !editorRef.current) return;
+    // Only consume if this is for the current file
+    if (pendingSourcePosition.filePath !== activeFilePath) return;
 
-      // Scroll to line and highlight
-      editor.revealLineInCenter(line);
-      editor.setPosition({ lineNumber: line, column: 1 });
+    const editor = editorRef.current;
+    const { startLine, endLine } = pendingSourcePosition;
 
-      // Highlight the range
-      const decorations = editor.deltaDecorations(decorationsRef.current, [{
-        range: new monaco.Range(line, 1, endLine || line, 1),
-        options: {
-          isWholeLine: true,
-          className: 'highlighted-line',
-          linesDecorationsClassName: 'highlighted-line-decoration',
-        },
-      }]);
-      decorationsRef.current = decorations;
+    // Validate line numbers
+    const model = editor.getModel();
+    if (!model) return;
+    const totalLines = model.getLineCount();
+    const safeLine = Math.min(Math.max(1, startLine), totalLines);
+    const safeEndLine = Math.min(Math.max(safeLine, endLine || startLine), totalLines);
 
-      // Clear highlight after 2 seconds
-      setTimeout(() => {
-        if (editorRef.current) {
-          decorationsRef.current = editorRef.current.deltaDecorations(decorationsRef.current, []);
-        }
-      }, 2000);
-    };
+    // Scroll to line and highlight
+    editor.revealLineInCenter(safeLine);
+    editor.setPosition({ lineNumber: safeLine, column: 1 });
 
-    window.addEventListener('mindmap-goto-line', handler);
-    return () => window.removeEventListener('mindmap-goto-line', handler);
-  }, []);
+    // Highlight the range
+    const decorations = editor.deltaDecorations(decorationsRef.current, [{
+      range: new monaco.Range(safeLine, 1, safeEndLine, 1),
+      options: {
+        isWholeLine: true,
+        className: 'highlighted-line',
+        linesDecorationsClassName: 'highlighted-line-decoration',
+      },
+    }]);
+    decorationsRef.current = decorations;
+
+    // Clear highlight after 2 seconds
+    setTimeout(() => {
+      if (editorRef.current) {
+        decorationsRef.current = editorRef.current.deltaDecorations(decorationsRef.current, []);
+      }
+    }, 2000);
+
+    // Consume the pending position
+    clearSourcePosition();
+  }, [pendingSourcePosition, activeFilePath, clearSourcePosition]);
 
   if (!activeFile) {
     return (

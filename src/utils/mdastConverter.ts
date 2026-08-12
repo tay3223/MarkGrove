@@ -2,6 +2,7 @@ import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
 import remarkStringify from 'remark-stringify';
+import remarkFrontmatter from 'remark-frontmatter';
 import { visit } from 'unist-util-visit';
 import type { MindmapNode } from '../types';
 
@@ -33,11 +34,11 @@ function headingStyle(level: number): MindmapNode['style'] {
 }
 
 export function parseMarkdown(content: string): any {
-  return unified().use(remarkParse).use(remarkGfm).parse(content);
+  return unified().use(remarkParse).use(remarkFrontmatter, ['yaml']).use(remarkGfm).parse(content);
 }
 
 export function stringifyMarkdown(ast: any): string {
-  return unified().use(remarkGfm).use(remarkStringify, {
+  return unified().use(remarkFrontmatter, ['yaml']).use(remarkGfm).use(remarkStringify, {
     bullet: '-',
     fences: true,
     listItemIndent: 'one',
@@ -228,8 +229,27 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       parent.children = parent.children || [];
       parent.children.push(fnNode);
       listStack = [];
+    } else if (child.type === 'yaml') {
+      // Front matter: render as a non-editable metadata block
+      const parent = headingStack.length > 0
+        ? headingStack[headingStack.length - 1].node
+        : root;
+      const fmNode: MindmapNode = {
+        topic: '[Front Matter]',
+        id: nextId(),
+        children: [],
+        style: { fontSize: '11px', color: '#6c7086', border: '1px dashed #6c7086' },
+        data: {
+          nodeType: 'frontmatter',
+          sourcePosition: child.position,
+          lineRange: child.position ? `${child.position.start.line}-${child.position.end.line}` : undefined,
+        },
+      };
+      parent.children = parent.children || [];
+      parent.children.push(fmNode);
+      listStack = [];
     }
-    // Silently skip: yaml (front matter), definition, etc.
+    // Silently skip: definition, etc.
   }
 
   return root;

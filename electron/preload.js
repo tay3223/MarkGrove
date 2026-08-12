@@ -14,6 +14,9 @@ contextBridge.exposeInMainWorld('api', {
   saveSession: (session) => ipcRenderer.invoke('save-session', session),
   getProjectName: (path) => ipcRenderer.invoke('get-project-name', path),
   showItemInFolder: (path) => ipcRenderer.invoke('show-item-in-folder', path),
+  getDirName: (path) => ipcRenderer.invoke('get-dir-name', path),
+  getSnapshots: () => ipcRenderer.invoke('get-snapshots'),
+  saveSnapshots: (snapshots) => ipcRenderer.invoke('save-snapshots', snapshots),
   onFileChanged: (callback) => {
     ipcRenderer.on('file-changed', (_event, data) => callback(data));
   },

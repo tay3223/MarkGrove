@@ -125,6 +125,7 @@ export default function Mindmap({
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<MindmapNode[]>([]);
   const [searchIndex, setSearchIndex] = useState(0);
+  const [selectedNode, setSelectedNode] = useState<MindmapNode | null>(null);
 
   const activeProjectId = useAppStore(s => s.activeProjectId);
   const activeFilePath = useAppStore(s => activeProjectId ? s.activeFilePath[activeProjectId] : null);
@@ -135,6 +136,7 @@ export default function Mindmap({
     return s.openFiles[pid]?.find(f => f.path === fp) ?? null;
   });
   const setActiveTab = useAppStore(s => s.setActiveTab);
+  const requestSourcePosition = useAppStore(s => s.requestSourcePosition);
 
   const fileName = activeFilePath ? activeFilePath.split(/[/\\]/).pop() || '' : '';
 
@@ -204,18 +206,24 @@ export default function Mindmap({
     }
   }, [searchResults, searchIndex]);
 
-  // Navigate to source code for a node
+  // Navigate to source code for a node - uses store state instead of DOM events
   const goToSource = useCallback((node: MindmapNode) => {
     const pos = node.data?.sourcePosition;
-    if (pos) {
+    if (pos && activeProjectId && activeFilePath) {
+      // Set the pending source position in the store
+      // SourceEditor will consume this when it mounts
+      requestSourcePosition({
+        filePath: activeFilePath,
+        projectId: activeProjectId,
+        startLine: pos.start.line,
+        endLine: pos.end.line,
+        startColumn: pos.start.column,
+        endColumn: pos.end.column,
+        nodeId: node.id,
+      });
       setActiveTab('source');
-      // The SourceEditor will handle scrolling to the line
-      // We use a custom event to communicate
-      window.dispatchEvent(new CustomEvent('mindmap-goto-line', {
-        detail: { line: pos.start.line, endLine: pos.end.line },
-      }));
     }
-  }, [setActiveTab]);
+  }, [setActiveTab, requestSourcePosition, activeProjectId, activeFilePath]);
 
   const rebuildMindmap = useCallback((content: string, shouldAutoFit: boolean) => {
     if (!containerRef.current) return;
@@ -267,9 +275,11 @@ export default function Mindmap({
       me.disposable.push(enableLeftButtonPan(me));
       onMindmapRoot?.(mindmapData);
 
+      // Single click: select node only
       me.bus.addListener('selectNodes', (nodes: any[]) => {
         const nodeObj = nodes && nodes[0];
         if (!nodeObj || !mindmapRootRef.current) {
+          setSelectedNode(null);
           onSelectNode?.(null);
           return;
         }
@@ -282,13 +292,18 @@ export default function Mindmap({
           return null;
         };
         const found = findById(mindmapRootRef.current);
+        setSelectedNode(found);
         onSelectNode?.(found);
-
-        // Double click to go to source
-        if (found) {
-          goToSource(found);
-        }
       });
+
+      // Double click: navigate to source
+      if (containerRef.current) {
+        containerRef.current.addEventListener('dblclick', () => {
+          if (selectedNode) {
+            goToSource(selectedNode);
+          }
+        });
+      }
 
       meRef.current = me;
 
@@ -301,7 +316,7 @@ export default function Mindmap({
       console.error('Failed to build mindmap:', err);
       showToast({ type: 'error', message: '脑图构建失败', detail: String(err) });
     }
-  }, [fileName, onMindmapRoot, onSelectNode, scheduleFit, goToSource, activeFilePath]);
+  }, [fileName, onMindmapRoot, onSelectNode, scheduleFit, goToSource, activeFilePath, selectedNode]);
 
   useEffect(() => {
     if (activeFile?.content !== undefined) {
@@ -346,11 +361,9 @@ export default function Mindmap({
       <div className="mindmap-toolbar">
         <span className="file-name">{fileName}</span>
         {activeFile.isDirty && <span className="dirty-dot" />}
-        {!isMindmapEditable && (
-          <span style={{ fontSize: '11px', color: 'var(--warning)', marginLeft: '8px' }}>
-            只读模式
-          </span>
-        )}
+        <span style={{ fontSize: '11px', color: 'var(--text-muted)', marginLeft: '8px' }}>
+          脑图只读 · 双击节点定位源码
+        </span>
         <div style={{ flex: 1 }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
           <input
