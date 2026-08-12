@@ -1,36 +1,7 @@
 import { useEffect, useRef } from 'react';
 import * as monaco from 'monaco-editor';
 import { useAppStore } from '../stores/appStore';
-
-/** Per-file Monaco models keyed by `projectId:filePath` */
-const models = new Map<string, monaco.editor.ITextModel>();
-/** Per-file view states keyed by `projectId:filePath` */
-const viewStates = new Map<string, monaco.editor.ICodeEditorViewState | null>();
-
-function modelKey(projectId: string, filePath: string): string {
-  return `${projectId}:${filePath}`;
-}
-
-function getOrCreateModel(projectId: string, filePath: string, content: string): monaco.editor.ITextModel {
-  const key = modelKey(projectId, filePath);
-  let model = models.get(key);
-  if (!model || model.isDisposed()) {
-    model = monaco.editor.createModel(content, 'markdown');
-    models.set(key, model);
-  }
-  return model;
-}
-
-/** Dispose model for a closed file to avoid memory leaks */
-export function disposeModel(projectId: string, filePath: string) {
-  const key = modelKey(projectId, filePath);
-  const model = models.get(key);
-  if (model && !model.isDisposed()) {
-    model.dispose();
-  }
-  models.delete(key);
-  viewStates.delete(key);
-}
+import { modelKey, getOrCreateModel, getViewState, setViewState, disposeModel } from '../utils/monacoModelRegistry';
 
 export default function SourceEditor() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -116,7 +87,7 @@ export default function SourceEditor() {
       // Save view state for current file before disposing
       if (prevFileKeyRef.current && editor) {
         try {
-          viewStates.set(prevFileKeyRef.current, editor.saveViewState());
+          setViewState(prevFileKeyRef.current, editor.saveViewState());
         } catch { /* ignore */ }
       }
       editor.dispose();
@@ -124,17 +95,17 @@ export default function SourceEditor() {
     };
   }, []);
 
-  // Sync model and view state when file changes
+  // Handle file switch: save/restore view state and set model
+  // This effect only runs when the file identity changes, not on every content update
+  const fileKey = activeProjectId && activeFilePath ? modelKey(activeProjectId, activeFilePath) : null;
   useEffect(() => {
     const editor = editorRef.current;
-    if (!editor || !activeFile || !activeProjectId || !activeFilePath) return;
-
-    const key = modelKey(activeProjectId, activeFilePath);
+    if (!editor || !activeFile || !activeProjectId || !activeFilePath || !fileKey) return;
 
     // Save view state for previous file
-    if (prevFileKeyRef.current && prevFileKeyRef.current !== key) {
+    if (prevFileKeyRef.current && prevFileKeyRef.current !== fileKey) {
       try {
-        viewStates.set(prevFileKeyRef.current, editor.saveViewState());
+        setViewState(prevFileKeyRef.current, editor.saveViewState());
       } catch { /* ignore */ }
     }
 
@@ -148,21 +119,43 @@ export default function SourceEditor() {
       loadingRef.current = false;
     }
 
-    // Set model on editor
+    // Set model on editor and restore view state only on actual file switch
     if (editor.getModel() !== model) {
       editor.setModel(model);
+      // Restore view state only when we actually switched models
+      const savedViewState = getViewState(fileKey);
+      if (savedViewState) {
+        try {
+          editor.restoreViewState(savedViewState);
+        } catch { /* ignore */ }
+      }
     }
 
-    // Restore view state for this file
-    const savedViewState = viewStates.get(key);
-    if (savedViewState) {
-      try {
-        editor.restoreViewState(savedViewState);
-      } catch { /* ignore */ }
-    }
+    prevFileKeyRef.current = fileKey;
+  }, [fileKey]); // Only depend on file identity, not content
 
-    prevFileKeyRef.current = key;
-  }, [activeFile?.path, activeFile?.content, activeProjectId, activeFilePath]);
+  // Sync content from store to model when content changes (same file)
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || !activeFile || !activeProjectId || !activeFilePath || !fileKey) return;
+    if (prevFileKeyRef.current !== fileKey) return; // Not the current file
+
+    const model = editor.getModel();
+    if (!model || model.isDisposed()) return;
+
+    // Only sync if content differs and we're not in the middle of user typing
+    if (model.getValue() !== activeFile.content && !loadingRef.current) {
+      // Use pushEditOperations to preserve undo stack and selection
+      const fullRange = model.getFullModelRange();
+      loadingRef.current = true;
+      model.pushEditOperations(
+        [],
+        [{ range: fullRange, text: activeFile.content }],
+        () => null
+      );
+      loadingRef.current = false;
+    }
+  }, [activeFile?.content, fileKey]);
 
   // Consume pending source position from store (mindmap → source navigation)
   useEffect(() => {

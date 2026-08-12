@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type { Project, OpenFile, FileNode, ViewTab, SessionState, UndoEntry, FileSnapshot, SourcePositionRequest, ConflictDetail, MindmapNodeRequest } from '../types';
 import { showToast } from '../components/Toast';
-import { disposeModel } from '../components/SourceEditor';
+import { disposeModel, disposeProjectModels } from '../utils/monacoModelRegistry';
 
 const MAX_UNDO_STEPS = 50;
 const MAX_SNAPSHOTS = 20;
@@ -61,7 +61,7 @@ interface AppState {
   redo: () => void;
   canUndo: () => boolean;
   canRedo: () => boolean;
-  takeSnapshot: (filePath: string, content: string, source?: 'auto' | 'conflict-backup' | 'manual', label?: string) => void;
+  takeSnapshot: (filePath: string, content: string, projectId: string, source?: 'auto' | 'conflict-backup' | 'manual', label?: string) => void;
   flushAllSaves: () => Promise<{ succeeded: number; failed: number; failedPaths: string[] }>;
   resolveConflict: (projectId: string, filePath: string, resolution: 'keep-local' | 'use-external') => Promise<void>;
   requestSourcePosition: (req: SourcePositionRequest) => void;
@@ -241,6 +241,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (project) {
       window.api.stopWatching(project.path);
     }
+    // Dispose all Monaco models for this project
+    disposeProjectModels(projectId);
     set(s => {
       const projects = s.projects.filter(p => p.id !== projectId);
       const openFiles = { ...s.openFiles };
@@ -394,7 +396,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Auto-snapshot periodically
     const now = Date.now();
     if (now - get().lastSnapshotTime > SNAPSHOT_INTERVAL) {
-      get().takeSnapshot(filePath, content);
+      get().takeSnapshot(filePath, content, projectId);
       set({ lastSnapshotTime: now });
     }
   },
@@ -617,7 +619,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     if (resolution === 'use-external') {
       // Backup local version as snapshot before replacing
-      get().takeSnapshot(filePath, file.content, 'conflict-backup', `冲突前本地版本 ${new Date().toLocaleTimeString()}`);
+      get().takeSnapshot(filePath, file.content, projectId, 'conflict-backup', `冲突前本地版本 ${new Date().toLocaleTimeString()}`);
 
       const result = await window.api.readFile(filePath);
       if (!result.error) {
@@ -644,7 +646,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     } else {
       // keep-local: backup current state as snapshot, then force save
-      get().takeSnapshot(filePath, file.content, 'conflict-backup', `强制保存前备份 ${new Date().toLocaleTimeString()}`);
+      get().takeSnapshot(filePath, file.content, projectId, 'conflict-backup', `强制保存前备份 ${new Date().toLocaleTimeString()}`);
       const success = await get().saveFile(projectId, filePath, true);
       if (success) {
         showToast({ type: 'success', message: `已强制保存: ${getFileName(filePath)}` });
@@ -759,13 +761,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     return (s.redoStacks[fp] || []).length > 0;
   },
 
-  takeSnapshot: (filePath, content, source = 'auto', label) => {
+  takeSnapshot: (filePath, content, projectId, source = 'auto', label) => {
     set(s => {
-      const newSnapshots = [...s.snapshots.slice(-MAX_SNAPSHOTS + 1), {
+      const newSnapshots: FileSnapshot[] = [...s.snapshots.slice(-MAX_SNAPSHOTS + 1), {
         filePath,
         content,
         timestamp: Date.now(),
-        projectId: s.activeProjectId || undefined,
+        projectId,
         source,
         label,
       }];

@@ -12,14 +12,42 @@ function nextId(): string {
   return `node-${++nodeCounter}-${Date.now().toString(36)}`;
 }
 
-/** Generate a stable ID from source position for mindmap nodes */
-function stableId(position: any): string {
-  if (!position) return nextId();
-  return `pos-${position.start.line}-${position.start.column}-${position.end.line}-${position.end.column}`;
+// Occurrence counters per parentPath + type + normalized content, reset per
+// conversion run. Using occurrence-of-same-content instead of a global sibling
+// index keeps IDs stable when unrelated siblings are inserted/removed.
+let occurrenceCounters = new Map<string, number>();
+
+function nextOccurrence(parentPath: string, nodeType: string, content: string): number {
+  const normalized = content.replace(/\s+/g, ' ').trim().slice(0, 60);
+  const key = `${parentPath}|${nodeType}|${normalized}`;
+  const idx = occurrenceCounters.get(key) || 0;
+  occurrenceCounters.set(key, idx + 1);
+  return idx;
+}
+
+/**
+ * Generate a stable ID from structural path (node type + normalized content + occurrence index).
+ * This survives position shifts caused by insertions/deletions before the node.
+ */
+function structuralId(nodeType: string, content: string, parentPath: string): string {
+  const occurrence = nextOccurrence(parentPath, nodeType, content);
+  // Normalize content: collapse whitespace, truncate for ID stability
+  const normalized = content.replace(/\s+/g, ' ').trim().slice(0, 60);
+  const path = parentPath ? `${parentPath}/${nodeType}-${occurrence}` : `${nodeType}-${occurrence}`;
+  // Simple hash of the full path + content to keep ID compact
+  let hash = 0;
+  const full = `${path}:${normalized}`;
+  for (let i = 0; i < full.length; i++) {
+    const chr = full.charCodeAt(i);
+    hash = ((hash << 5) - hash) + chr;
+    hash |= 0;
+  }
+  return `s${Math.abs(hash).toString(36)}`;
 }
 
 export function resetNodeCounter(): void {
   nodeCounter = 0;
+  occurrenceCounters = new Map();
 }
 
 const CODE_NODE_STYLE = {
@@ -64,13 +92,26 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
   let currentParent = root;
   let listStack: Array<{ node: MindmapNode; depth: number }> = [];
 
+  // Build structural path from heading stack
+  function currentPath(): string {
+    return headingStack.map(h => h.node.id).join('/');
+  }
+
   for (const child of ast.children) {
     if (child.type === 'heading') {
       const text = extractText(child);
       const level = child.depth;
+
+      // Pop BEFORE computing parent so same-level headings share 'root' or the
+      // correct ancestor as parent identity
+      while (headingStack.length > 0 && headingStack[headingStack.length - 1].level >= level) {
+        headingStack.pop();
+      }
+
+      const parentPath = currentPath();
       const node: MindmapNode = {
         topic: text,
-        id: stableId(child.position),
+        id: structuralId('heading', text, parentPath),
         children: [],
         style: headingStyle(level),
         data: {
@@ -79,10 +120,6 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
           sourcePosition: child.position,
         },
       };
-
-      while (headingStack.length > 0 && headingStack[headingStack.length - 1].level >= level) {
-        headingStack.pop();
-      }
 
       const parent = headingStack.length > 0
         ? headingStack[headingStack.length - 1].node
@@ -96,7 +133,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       const parent = headingStack.length > 0
         ? headingStack[headingStack.length - 1].node
         : root;
-      const listNodes = convertListToNodes(child, 0);
+      const listNodes = convertListToNodes(child, currentPath());
       parent.children = parent.children || [];
       parent.children.push(...listNodes);
       currentParent = parent;
@@ -106,7 +143,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       const codeSummary = firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine;
       const codeNode: MindmapNode = {
         topic: `[${child.lang || 'code'}] ${codeSummary}`,
-        id: stableId(child.position),
+        id: structuralId('code', child.value || '', currentPath()),
         children: [],
         style: { ...CODE_NODE_STYLE },
         data: {
@@ -136,7 +173,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         } else {
           const paraNode: MindmapNode = {
             topic: text,
-            id: stableId(child.position),
+            id: structuralId('paragraph', text, ''),
             children: [],
             data: {
               nodeType: 'list',
@@ -155,7 +192,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const quoteNode: MindmapNode = {
         topic: `> ${text}`,
-        id: stableId(child.position),
+        id: structuralId('blockquote', text, currentPath()),
         children: [],
         data: {
           nodeType: 'list',
@@ -171,7 +208,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const tableNode: MindmapNode = {
         topic: '[表格]',
-        id: stableId(child.position),
+        id: structuralId('table', '', currentPath()),
         children: [],
         style: { fontSize: '12px', color: '#94e2d5', border: '1px dashed #94e2d5' },
         data: {
@@ -189,7 +226,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const htmlNode: MindmapNode = {
         topic: '[HTML]',
-        id: stableId(child.position),
+        id: structuralId('html', child.value || '', currentPath()),
         children: [],
         style: { fontSize: '12px', color: '#f38ba8', border: '1px dashed #f38ba8' },
         data: {
@@ -207,7 +244,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const hrNode: MindmapNode = {
         topic: '———',
-        id: stableId(child.position),
+        id: structuralId('thematicBreak', '', currentPath()),
         children: [],
         style: { fontSize: '11px', color: '#6c7086' },
         data: {
@@ -224,7 +261,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const fnNode: MindmapNode = {
         topic: `[脚注: ${child.identifier || ''}]`,
-        id: stableId(child.position),
+        id: structuralId('footnote', child.identifier || '', currentPath()),
         children: [],
         style: { fontSize: '11px', color: '#f9e2af' },
         data: {
@@ -242,7 +279,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const fmNode: MindmapNode = {
         topic: '[Front Matter]',
-        id: stableId(child.position),
+        id: structuralId('frontmatter', child.value || '', currentPath()),
         children: [],
         style: { fontSize: '11px', color: '#6c7086', border: '1px dashed #6c7086' },
         data: {
@@ -258,24 +295,53 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
     // Silently skip: definition, etc.
   }
 
+  // Final safety net: structural IDs are stable across position shifts, but
+  // pathological content could still collide. Mind Elixir breaks on duplicate
+  // IDs (blank canvas), so enforce uniqueness deterministically.
+  const seenIds = new Set<string>();
+  const dedupe = (n: MindmapNode) => {
+    if (seenIds.has(n.id)) {
+      let k = 1;
+      while (seenIds.has(`${n.id}-${k}`)) k++;
+      n.id = `${n.id}-${k}`;
+    }
+    seenIds.add(n.id);
+    n.children?.forEach(dedupe);
+  };
+  dedupe(root);
+
   return root;
 }
 
-function convertListToNodes(listNode: any, depth: number): MindmapNode[] {
+function convertListToNodes(listNode: any, parentPath: string): MindmapNode[] {
   const nodes: MindmapNode[] = [];
   for (const item of listNode.children) {
     if (item.type !== 'listItem') continue;
+    // Pass 1: extract own text (needed to compute a stable item ID first)
     let text = '';
-    const childNodes: MindmapNode[] = [];
     for (const sub of item.children) {
       if (sub.type === 'paragraph') {
         text = extractText(sub);
-      } else if (sub.type === 'list') {
-        childNodes.push(...convertListToNodes(sub, depth + 1));
+      }
+    }
+    if (listNode.ordered) {
+      const idx = listNode.children.indexOf(item) + (listNode.start || 1);
+      text = `${idx}. ${text}`;
+    }
+    const itemId = structuralId('list', text, parentPath);
+    // Nested content identity includes this item's ID so identical sub-items
+    // under different parents never collide
+    const itemPath = parentPath ? `${parentPath}/${itemId}` : itemId;
+
+    // Pass 2: build children with the hierarchical path
+    const childNodes: MindmapNode[] = [];
+    for (const sub of item.children) {
+      if (sub.type === 'list') {
+        childNodes.push(...convertListToNodes(sub, itemPath));
       } else if (sub.type === 'code') {
         childNodes.push({
           topic: `[${sub.lang || 'code'}]`,
-          id: stableId(sub.position),
+          id: structuralId('code', sub.value || '', itemPath),
           children: [],
           style: { ...CODE_NODE_STYLE },
           data: {
@@ -287,13 +353,9 @@ function convertListToNodes(listNode: any, depth: number): MindmapNode[] {
         });
       }
     }
-    if (listNode.ordered) {
-      const idx = listNode.children.indexOf(item) + (listNode.start || 1);
-      text = `${idx}. ${text}`;
-    }
     nodes.push({
       topic: text,
-      id: stableId(item.position),
+      id: itemId,
       children: childNodes,
       data: {
         nodeType: 'list',

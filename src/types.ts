@@ -158,6 +158,7 @@ declare global {
       onFileChanged: (callback: (data: FileChangedEvent) => void) => void;
       removeFileChangedListener: () => void;
       onBeforeClose: (callback: () => Promise<boolean>) => void;
+      removeBeforeCloseListener: () => void;
       confirmClose: () => void;
     };
   }

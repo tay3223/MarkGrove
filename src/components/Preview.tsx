@@ -176,13 +176,15 @@ export default function Preview() {
       const href = link.getAttribute('href');
       if (!href) return;
 
-      // Handle relative .md links - resolve via IPC and open in app
-      if (/\.(md|markdown|mdown|mkd)$/i.test(href) && !href.startsWith('http')) {
+      // Handle relative .md links (with optional fragment/query) - resolve via IPC and open in app
+      const mdLinkMatch = href.match(/^(.*?\.(?:md|markdown|mdown|mkd))([#?].*)?$/i);
+      if (mdLinkMatch && !href.startsWith('http')) {
         e.preventDefault();
+        const mdPath = mdLinkMatch[1]; // Path without fragment/query
         if (activeProjectId && activeFilePath) {
           try {
             const currentDir = await window.api.getDirName(activeFilePath);
-            const result = await window.api.resolvePath(currentDir, href);
+            const result = await window.api.resolvePath(currentDir, mdPath);
             if (result.error) {
               showToast({ type: 'error', message: '无法解析链接路径', detail: result.error });
               return;

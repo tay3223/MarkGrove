@@ -77,6 +77,9 @@ export default function App() {
       }
       return false; // Cancel - keep window open
     });
+    return () => {
+      window.api.removeBeforeCloseListener();
+    };
   }, [flushAllSaves]);
 
   // Global keyboard shortcuts

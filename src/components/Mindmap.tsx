@@ -132,7 +132,7 @@ export default function Mindmap({
   // Track dblclick listener for cleanup
   const dblclickCleanupRef = useRef<(() => void) | null>(null);
   // Save/restore view state across rebuilds
-  const viewStateRef = useRef<{ scale: number; dx: number; dy: number } | null>(null);
+  const viewStateRef = useRef<{ transform: string } | null>(null);
   // Save/restore expanded node IDs across refreshes
   const expandedNodeIdsRef = useRef<Set<string>>(new Set());
   // Save/restore selected node ID across refreshes
@@ -287,11 +287,11 @@ export default function Mindmap({
           selectedNodeIdRef.current = selectedNodeRef.current.id;
         }
         try {
-          viewStateRef.current = {
-            scale: meRef.current.scaleVal,
-            dx: meRef.current.dx || 0,
-            dy: meRef.current.dy || 0,
-          };
+          // Save absolute transform from DOM element
+          const mapEl = meRef.current.map;
+          if (mapEl) {
+            viewStateRef.current = { transform: mapEl.style.transform || '' };
+          }
         } catch { /* ignore */ }
 
         // Apply saved expanded state to new data
@@ -302,11 +302,13 @@ export default function Mindmap({
         meRef.current.refresh({ nodeData: mindmapData });
         onMindmapRoot?.(mindmapData);
 
-        // Restore view state
+        // Restore view state using absolute transform
         if (viewStateRef.current) {
           try {
-            meRef.current.scale(viewStateRef.current.scale);
-            meRef.current.move(viewStateRef.current.dx, viewStateRef.current.dy);
+            const mapEl = meRef.current.map;
+            if (mapEl && viewStateRef.current.transform) {
+              mapEl.style.transform = viewStateRef.current.transform;
+            }
           } catch { /* ignore */ }
         }
 

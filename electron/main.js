@@ -16,10 +16,21 @@ const recentWrites = new Map(); // filePath -> timestamp
 const SELF_WRITE_SUPPRESS_MS = 1500;
 
 let mainWindow = null;
-let allowClose = false;
+// Per-window close authorization: Map<webContentsId, boolean>
+const closeAuthorized = new Map();
+
+// Register IPC listener once at module level, not per-window
+ipcMain.on('before-close-confirmed', (event) => {
+  const wcId = event.sender.id;
+  closeAuthorized.set(wcId, true);
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win && !win.isDestroyed()) {
+    win.close();
+  }
+});
 
 function createWindow() {
-  mainWindow = new BrowserWindow({
+  const win = new BrowserWindow({
     title: 'MarkGrove · 墨林',
     width: 1400,
     height: 900,
@@ -38,11 +49,15 @@ function createWindow() {
     },
     show: false,
   });
+  mainWindow = win;
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  // Initialize close authorization for this window
+  closeAuthorized.set(win.webContents.id, false);
+
+  win.once('ready-to-show', () => win.show());
 
   // Intercept new window requests - open external links in system browser
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+  win.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('http://') || url.startsWith('https://')) {
       shell.openExternal(url);
     }
@@ -50,33 +65,35 @@ function createWindow() {
   });
 
   // Intercept navigation to external URLs
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    const currentUrl = mainWindow.webContents.getURL();
+  win.webContents.on('will-navigate', (event, url) => {
+    const currentUrl = win.webContents.getURL();
     if (url !== currentUrl && (url.startsWith('http://') || url.startsWith('https://'))) {
       event.preventDefault();
       shell.openExternal(url);
     }
   });
 
-  mainWindow.on('close', (e) => {
-    if (!allowClose) {
+  win.on('close', (e) => {
+    const wcId = win.webContents.id;
+    if (!closeAuthorized.get(wcId)) {
       e.preventDefault();
-      mainWindow.webContents.send('before-close-request');
+      win.webContents.send('before-close-request');
     }
   });
 
-  ipcMain.on('before-close-confirmed', () => {
-    allowClose = true;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.close();
+  // Clean up when window is destroyed
+  win.on('closed', () => {
+    closeAuthorized.delete(win.webContents.id);
+    if (mainWindow === win) {
+      mainWindow = null;
     }
   });
 
   if (isDev) {
-    mainWindow.loadURL('http://localhost:5173');
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
+    win.loadURL('http://localhost:5173');
+    win.webContents.openDevTools({ mode: 'detach' });
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+    win.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 }
 

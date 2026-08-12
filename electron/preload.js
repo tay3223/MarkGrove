@@ -1,5 +1,8 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+// Store the before-close handler reference for proper cleanup
+let beforeCloseHandler = null;
+
 contextBridge.exposeInMainWorld('api', {
   openDirectory: () => ipcRenderer.invoke('open-directory'),
   openFileDialog: () => ipcRenderer.invoke('open-file-dialog'),
@@ -26,12 +29,23 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.removeAllListeners('file-changed');
   },
   onBeforeClose: (callback) => {
-    ipcRenderer.on('before-close-request', async () => {
+    // Remove previous listener if any to prevent duplicates
+    if (beforeCloseHandler) {
+      ipcRenderer.removeListener('before-close-request', beforeCloseHandler);
+    }
+    beforeCloseHandler = async () => {
       const canClose = await callback();
       if (canClose) {
         ipcRenderer.send('before-close-confirmed');
       }
-    });
+    };
+    ipcRenderer.on('before-close-request', beforeCloseHandler);
+  },
+  removeBeforeCloseListener: () => {
+    if (beforeCloseHandler) {
+      ipcRenderer.removeListener('before-close-request', beforeCloseHandler);
+      beforeCloseHandler = null;
+    }
   },
   confirmClose: () => {
     ipcRenderer.send('before-close-confirmed');

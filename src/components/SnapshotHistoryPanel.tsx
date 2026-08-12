@@ -82,7 +82,7 @@ export default function SnapshotHistoryPanel() {
     // Backup current content AFTER user confirmed, BEFORE actual restore
     const fileToBackup = useAppStore.getState().openFiles[targetPid]?.find(f => f.path === snapshot.filePath);
     if (fileToBackup) {
-      takeSnapshot(snapshot.filePath, fileToBackup.content, 'conflict-backup', `恢复前备份 ${new Date().toLocaleTimeString()}`);
+      takeSnapshot(snapshot.filePath, fileToBackup.content, targetPid, 'conflict-backup', `恢复前备份 ${new Date().toLocaleTimeString()}`);
     }
 
     // Perform restore and check result
