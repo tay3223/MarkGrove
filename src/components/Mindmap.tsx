@@ -3,7 +3,12 @@ import MindElixir from 'mind-elixir';
 import { DARK_THEME } from 'mind-elixir';
 import type { MainLineParams, MindElixirInstance, SubLineParams } from 'mind-elixir';
 import { useAppStore } from '../stores/appStore';
-import { parseMarkdown, mdastToMindmap } from '../utils/mdastConverter';
+import {
+  parseMarkdown as parseSemantic,
+  projectTree,
+  viewToMindmap,
+  createSourceLookup,
+} from '../semantic';
 import type { MindmapNode } from '../types';
 import { showToast } from './Toast';
 
@@ -311,9 +316,12 @@ export default function Mindmap({
   const rebuildMindmap = useCallback((content: string, shouldAutoFit: boolean) => {
     if (!containerRef.current) return;
     try {
-      const ast = parseMarkdown(content);
-      astRef.current = ast;
-      const mindmapData = mdastToMindmap(ast, fileName);
+      // New semantic pipeline: Source → Semantic Tree → View Tree → MindmapNode
+      const { root: semanticRoot } = parseSemantic(content, fileName || 'untitled.md');
+      const viewTree = projectTree(semanticRoot, 'balanced');
+      const sourceLookup = createSourceLookup(semanticRoot);
+      const mindmapData = viewToMindmap(viewTree, sourceLookup);
+      astRef.current = semanticRoot;
 
       // If we have an existing instance, use refresh for content updates (no destroy)
       if (meRef.current && !shouldAutoFit) {

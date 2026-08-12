@@ -1,7 +1,27 @@
 import { useState } from 'react';
 import { useAppStore } from '../stores/appStore';
-import { flattenMindmapForOutline } from '../utils/mdastConverter';
 import type { MindmapNode } from '../types';
+
+/** Flatten a MindmapNode tree into a linear outline list. */
+function flattenMindmapForOutline(root: MindmapNode, depth = 0): Array<{
+  id: string;
+  topic: string;
+  depth: number;
+  nodeType?: string;
+}> {
+  const items: Array<{ id: string; topic: string; depth: number; nodeType?: string }> = [{
+    id: root.id,
+    topic: root.topic,
+    depth,
+    nodeType: root.data?.nodeType,
+  }];
+  if (root.children) {
+    for (const child of root.children) {
+      items.push(...flattenMindmapForOutline(child, depth + 1));
+    }
+  }
+  return items;
+}
 
 type AuxTab = 'outline' | 'code' | 'props';
 
