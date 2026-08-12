@@ -39,29 +39,59 @@ export default function SnapshotHistoryPanel() {
     : snapshots;
 
   const handleRestore = async (snapshot: FileSnapshot) => {
-    if (!activeProjectId) return;
-
-    // Backup current content before restoring
-    const currentFile = useAppStore.getState().openFiles[activeProjectId]?.find(f => f.path === snapshot.filePath);
-    if (currentFile) {
-      takeSnapshot(snapshot.filePath, currentFile.content, 'conflict-backup', `恢复前备份 ${new Date().toLocaleTimeString()}`);
+    // Determine target project: prefer snapshot's projectId, fall back to active
+    const targetPid = snapshot.projectId || activeProjectId;
+    if (!targetPid) {
+      showToast({ type: 'error', message: '无法确定快照所属项目' });
+      return;
     }
 
+    // Verify the target project still exists
+    const targetProject = useAppStore.getState().projects.find(p => p.id === targetPid);
+    if (!targetProject) {
+      showToast({ type: 'error', message: '快照所属项目已被移除，无法恢复' });
+      return;
+    }
+
+    // Confirm before doing anything
     const confirmed = await confirmDialog({
       title: '恢复快照',
-      message: `确定要恢复 "${getFileName(snapshot.filePath)}" 到 ${formatTime(snapshot.timestamp)} 的版本吗？\n当前内容已自动备份为快照。`,
+      message: `确定要恢复 "${getFileName(snapshot.filePath)}" 到 ${formatTime(snapshot.timestamp)} 的版本吗？\n当前内容将在恢复前自动备份为快照。`,
       confirmLabel: '恢复',
       danger: true,
     });
     if (!confirmed) return;
 
-    // If file is not open, open it first
-    if (!currentFile && activeProjectId) {
-      await openFile(activeProjectId, snapshot.filePath);
+    // If file is not open in the target project, open it first
+    const currentFile = useAppStore.getState().openFiles[targetPid]?.find(f => f.path === snapshot.filePath);
+    if (!currentFile) {
+      try {
+        await openFile(targetPid, snapshot.filePath);
+        // Verify the file was actually opened
+        const opened = useAppStore.getState().openFiles[targetPid]?.find(f => f.path === snapshot.filePath);
+        if (!opened) {
+          showToast({ type: 'error', message: '无法打开目标文件，恢复已取消' });
+          return;
+        }
+      } catch {
+        showToast({ type: 'error', message: '打开目标文件失败，恢复已取消' });
+        return;
+      }
     }
 
-    restoreSnapshot(snapshot);
-    showToast({ type: 'success', message: '快照已恢复' });
+    // Backup current content AFTER user confirmed, BEFORE actual restore
+    const fileToBackup = useAppStore.getState().openFiles[targetPid]?.find(f => f.path === snapshot.filePath);
+    if (fileToBackup) {
+      takeSnapshot(snapshot.filePath, fileToBackup.content, 'conflict-backup', `恢复前备份 ${new Date().toLocaleTimeString()}`);
+    }
+
+    // Perform restore and check result
+    const success = restoreSnapshot(snapshot);
+    if (success) {
+      showToast({ type: 'success', message: `已恢复快照: ${getFileName(snapshot.filePath)}` });
+    } else {
+      showToast({ type: 'error', message: '快照恢复失败', detail: '目标文件可能已被关闭或项目已移除' });
+    }
   };
 
   return (

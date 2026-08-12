@@ -133,6 +133,10 @@ export default function Mindmap({
   const dblclickCleanupRef = useRef<(() => void) | null>(null);
   // Save/restore view state across rebuilds
   const viewStateRef = useRef<{ scale: number; dx: number; dy: number } | null>(null);
+  // Save/restore expanded node IDs across refreshes
+  const expandedNodeIdsRef = useRef<Set<string>>(new Set());
+  // Save/restore selected node ID across refreshes
+  const selectedNodeIdRef = useRef<string | null>(null);
   // Debounce timer for content changes
   const rebuildTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Track whether this is a file switch (immediate rebuild) vs content change (debounced)
@@ -238,11 +242,50 @@ export default function Mindmap({
     }
   }, [setActiveTab, requestSourcePosition, activeProjectId, activeFilePath]);
 
+  /** Collect expanded node IDs from current Mind Elixir instance data */
+  const collectExpandedIds = useCallback(() => {
+    const me = meRef.current;
+    if (!me) return;
+    try {
+      const data = me.getData();
+      const ids = new Set<string>();
+      const walk = (node: any) => {
+        if (node.expanded !== false && node.children && node.children.length > 0) {
+          ids.add(node.id);
+        }
+        node.children?.forEach(walk);
+      };
+      if (data?.nodeData) walk(data.nodeData);
+      expandedNodeIdsRef.current = ids;
+    } catch { /* ignore */ }
+  }, []);
+
+  /** Apply expanded state to new mindmap data based on saved IDs */
+  const applyExpandedState = useCallback((node: MindmapNode) => {
+    const saved = expandedNodeIdsRef.current;
+    const walk = (n: MindmapNode) => {
+      if (n.children && n.children.length > 0) {
+        (n as any).expanded = saved.has(n.id);
+        n.children.forEach(walk);
+      }
+    };
+    walk(node);
+  }, []);
+
   const rebuildMindmap = useCallback((content: string, shouldAutoFit: boolean) => {
     if (!containerRef.current) return;
     try {
-      // Save current view state before destroying
-      if (meRef.current) {
+      const ast = parseMarkdown(content);
+      astRef.current = ast;
+      const mindmapData = mdastToMindmap(ast, fileName);
+
+      // If we have an existing instance, use refresh for content updates (no destroy)
+      if (meRef.current && !shouldAutoFit) {
+        // Save current state before refresh
+        collectExpandedIds();
+        if (selectedNodeRef.current) {
+          selectedNodeIdRef.current = selectedNodeRef.current.id;
+        }
         try {
           viewStateRef.current = {
             scale: meRef.current.scaleVal,
@@ -250,11 +293,46 @@ export default function Mindmap({
             dy: meRef.current.dy || 0,
           };
         } catch { /* ignore */ }
+
+        // Apply saved expanded state to new data
+        applyExpandedState(mindmapData);
+        mindmapRootRef.current = mindmapData;
+
+        // Use refresh instead of destroy+recreate
+        meRef.current.refresh({ nodeData: mindmapData });
+        onMindmapRoot?.(mindmapData);
+
+        // Restore view state
+        if (viewStateRef.current) {
+          try {
+            meRef.current.scale(viewStateRef.current.scale);
+            meRef.current.move(viewStateRef.current.dx, viewStateRef.current.dy);
+          } catch { /* ignore */ }
+        }
+
+        // Restore selected node
+        if (selectedNodeIdRef.current) {
+          try {
+            const findById = (n: MindmapNode): MindmapNode | null => {
+              if (n.id === selectedNodeIdRef.current) return n;
+              for (const c of n.children || []) {
+                const f = findById(c);
+                if (f) return f;
+              }
+              return null;
+            };
+            const found = findById(mindmapData);
+            if (found) {
+              meRef.current.selectNode(found.id);
+              setSelectedNode(found);
+              onSelectNode?.(found);
+            }
+          } catch { /* ignore */ }
+        }
+        return;
       }
 
-      const ast = parseMarkdown(content);
-      astRef.current = ast;
-      const mindmapData = mdastToMindmap(ast, fileName);
+      // Full rebuild: file switch or first render
       mindmapRootRef.current = mindmapData;
 
       if (meRef.current) {
@@ -322,7 +400,6 @@ export default function Mindmap({
 
       // Double click: navigate to source (use ref for latest selectedNode)
       if (containerRef.current) {
-        // Clean up previous listener
         dblclickCleanupRef.current?.();
         const container = containerRef.current;
         const handleDblClick = () => {
@@ -342,19 +419,13 @@ export default function Mindmap({
       if (shouldAutoFit) {
         pendingAutoFitFilePathRef.current = activeFilePath || null;
         scheduleFit(activeFilePath || '');
-      } else if (viewStateRef.current) {
-        // Restore previous view state for content updates
-        try {
-          me.scale(viewStateRef.current.scale);
-          me.move(viewStateRef.current.dx, viewStateRef.current.dy);
-        } catch { /* ignore */ }
       }
     } catch (err) {
       pendingAutoFitFilePathRef.current = null;
       console.error('Failed to build mindmap:', err);
       showToast({ type: 'error', message: '脑图构建失败', detail: String(err) });
     }
-  }, [fileName, onMindmapRoot, onSelectNode, scheduleFit, goToSource, activeFilePath]);
+  }, [fileName, onMindmapRoot, onSelectNode, scheduleFit, goToSource, activeFilePath, collectExpandedIds, applyExpandedState]);
 
   useEffect(() => {
     if (activeFile?.content !== undefined) {

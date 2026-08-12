@@ -41,6 +41,23 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
+  // Intercept new window requests - open external links in system browser
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+
+  // Intercept navigation to external URLs
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const currentUrl = mainWindow.webContents.getURL();
+    if (url !== currentUrl && (url.startsWith('http://') || url.startsWith('https://'))) {
+      event.preventDefault();
+      shell.openExternal(url);
+    }
+  });
+
   mainWindow.on('close', (e) => {
     if (!allowClose) {
       e.preventDefault();
@@ -282,6 +299,26 @@ ipcMain.handle('show-item-in-folder', (_event, filePath) => {
 
 ipcMain.handle('get-dir-name', (_event, filePath) => {
   return path.dirname(filePath);
+});
+
+// Resolve a relative path against a base directory, with project boundary check
+ipcMain.handle('resolve-path', (_event, baseDir, relativePath) => {
+  try {
+    const resolved = path.resolve(baseDir, relativePath);
+    if (!isPathInProject(resolved)) {
+      return { error: '解析后的路径不在已打开的项目目录内' };
+    }
+    return { resolved };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+// Open external URL in system browser
+ipcMain.handle('open-external', (_event, url) => {
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    shell.openExternal(url);
+  }
 });
 
 // Snapshot persistence

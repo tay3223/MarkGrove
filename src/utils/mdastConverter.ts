@@ -12,6 +12,12 @@ function nextId(): string {
   return `node-${++nodeCounter}-${Date.now().toString(36)}`;
 }
 
+/** Generate a stable ID from source position for mindmap nodes */
+function stableId(position: any): string {
+  if (!position) return nextId();
+  return `pos-${position.start.line}-${position.start.column}-${position.end.line}-${position.end.column}`;
+}
+
 export function resetNodeCounter(): void {
   nodeCounter = 0;
 }
@@ -49,7 +55,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
   resetNodeCounter();
   const root: MindmapNode = {
     topic: fileName.replace(/\.md$/, ''),
-    id: nextId(),
+    id: 'root',
     children: [],
     data: { nodeType: 'root' },
   };
@@ -64,7 +70,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       const level = child.depth;
       const node: MindmapNode = {
         topic: text,
-        id: nextId(),
+        id: stableId(child.position),
         children: [],
         style: headingStyle(level),
         data: {
@@ -100,7 +106,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       const codeSummary = firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine;
       const codeNode: MindmapNode = {
         topic: `[${child.lang || 'code'}] ${codeSummary}`,
-        id: nextId(),
+        id: stableId(child.position),
         children: [],
         style: { ...CODE_NODE_STYLE },
         data: {
@@ -130,7 +136,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         } else {
           const paraNode: MindmapNode = {
             topic: text,
-            id: nextId(),
+            id: stableId(child.position),
             children: [],
             data: {
               nodeType: 'list',
@@ -149,7 +155,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const quoteNode: MindmapNode = {
         topic: `> ${text}`,
-        id: nextId(),
+        id: stableId(child.position),
         children: [],
         data: {
           nodeType: 'list',
@@ -165,7 +171,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const tableNode: MindmapNode = {
         topic: '[表格]',
-        id: nextId(),
+        id: stableId(child.position),
         children: [],
         style: { fontSize: '12px', color: '#94e2d5', border: '1px dashed #94e2d5' },
         data: {
@@ -183,7 +189,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const htmlNode: MindmapNode = {
         topic: '[HTML]',
-        id: nextId(),
+        id: stableId(child.position),
         children: [],
         style: { fontSize: '12px', color: '#f38ba8', border: '1px dashed #f38ba8' },
         data: {
@@ -201,7 +207,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const hrNode: MindmapNode = {
         topic: '———',
-        id: nextId(),
+        id: stableId(child.position),
         children: [],
         style: { fontSize: '11px', color: '#6c7086' },
         data: {
@@ -218,7 +224,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const fnNode: MindmapNode = {
         topic: `[脚注: ${child.identifier || ''}]`,
-        id: nextId(),
+        id: stableId(child.position),
         children: [],
         style: { fontSize: '11px', color: '#f9e2af' },
         data: {
@@ -236,7 +242,7 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         : root;
       const fmNode: MindmapNode = {
         topic: '[Front Matter]',
-        id: nextId(),
+        id: stableId(child.position),
         children: [],
         style: { fontSize: '11px', color: '#6c7086', border: '1px dashed #6c7086' },
         data: {
@@ -269,7 +275,7 @@ function convertListToNodes(listNode: any, depth: number): MindmapNode[] {
       } else if (sub.type === 'code') {
         childNodes.push({
           topic: `[${sub.lang || 'code'}]`,
-          id: nextId(),
+          id: stableId(sub.position),
           children: [],
           style: { ...CODE_NODE_STYLE },
           data: {
@@ -287,7 +293,7 @@ function convertListToNodes(listNode: any, depth: number): MindmapNode[] {
     }
     nodes.push({
       topic: text,
-      id: nextId(),
+      id: stableId(item.position),
       children: childNodes,
       data: {
         nodeType: 'list',

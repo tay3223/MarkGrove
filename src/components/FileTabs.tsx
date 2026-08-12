@@ -57,15 +57,14 @@ export default function FileTabs() {
     return true;
   }, [activeProjectId, saveFile, closeFile]);
 
-  const handleCloseOthers = useCallback(async (keepPath: string) => {
+  /** Shared batch save-and-close logic. Saves dirty files, closes only successful ones. */
+  const batchSaveAndClose = useCallback(async (filesToClose: typeof openFiles, title: string) => {
     if (!activeProjectId) return;
-    const others = openFiles.filter(f => f.path !== keepPath);
-    const dirtyFiles = others.filter(f => f.isDirty);
+    const dirtyFiles = filesToClose.filter(f => f.isDirty);
 
-    // If there are dirty files, ask user what to do
     if (dirtyFiles.length > 0) {
       const choice = await choiceDialog({
-        title: '批量关闭',
+        title,
         message: `有 ${dirtyFiles.length} 个文件未保存：\n${dirtyFiles.map(f => getFileName(f.path)).join(', ')}\n\n如何处理？`,
         buttons: [
           { label: '全部保存并关闭', value: 'save-all', primary: true },
@@ -76,21 +75,21 @@ export default function FileTabs() {
       if (choice === 'cancel') return;
 
       if (choice === 'save-all') {
-        const failed: string[] = [];
+        const failedPaths: string[] = [];
         for (const f of dirtyFiles) {
           const success = await saveFile(activeProjectId, f.path);
-          if (!success) failed.push(getFileName(f.path));
+          if (!success) failedPaths.push(f.path);
         }
-        if (failed.length > 0) {
+        if (failedPaths.length > 0) {
+          const failedSet = new Set(failedPaths);
           showToast({
             type: 'warning',
-            message: `${failed.length} 个文件保存失败`,
-            detail: failed.join(', '),
+            message: `${failedPaths.length} 个文件保存失败`,
+            detail: failedPaths.map(fp => getFileName(fp)).join(', '),
           });
-          // Close only successfully saved files
-          const savedPaths = new Set(dirtyFiles.filter(f => !failed.includes(getFileName(f.path))).map(f => f.path));
-          for (const f of others) {
-            if (!f.isDirty || savedPaths.has(f.path)) {
+          // Close only files that are not dirty or were successfully saved
+          for (const f of filesToClose) {
+            if (!f.isDirty || !failedSet.has(f.path)) {
               closeFile(activeProjectId, f.path);
             }
           }
@@ -100,55 +99,19 @@ export default function FileTabs() {
       // 'discard-all' - close all without saving
     }
 
-    for (const f of others) {
+    for (const f of filesToClose) {
       closeFile(activeProjectId, f.path);
     }
-  }, [activeProjectId, openFiles, saveFile, closeFile]);
+  }, [activeProjectId, saveFile, closeFile]);
+
+  const handleCloseOthers = useCallback(async (keepPath: string) => {
+    const others = openFiles.filter(f => f.path !== keepPath);
+    await batchSaveAndClose(others, '批量关闭');
+  }, [openFiles, batchSaveAndClose]);
 
   const handleCloseAll = useCallback(async () => {
-    if (!activeProjectId) return;
-    const dirtyFiles = openFiles.filter(f => f.isDirty);
-
-    if (dirtyFiles.length > 0) {
-      const choice = await choiceDialog({
-        title: '关闭全部',
-        message: `有 ${dirtyFiles.length} 个文件未保存：\n${dirtyFiles.map(f => getFileName(f.path)).join(', ')}\n\n如何处理？`,
-        buttons: [
-          { label: '全部保存并关闭', value: 'save-all', primary: true },
-          { label: '全部不保存', value: 'discard-all', danger: true },
-          { label: '取消', value: 'cancel' },
-        ],
-      });
-      if (choice === 'cancel') return;
-
-      if (choice === 'save-all') {
-        const failed: string[] = [];
-        for (const f of dirtyFiles) {
-          const success = await saveFile(activeProjectId, f.path);
-          if (!success) failed.push(getFileName(f.path));
-        }
-        if (failed.length > 0) {
-          showToast({
-            type: 'warning',
-            message: `${failed.length} 个文件保存失败`,
-            detail: failed.join(', '),
-          });
-          // Close only successfully saved files
-          const savedPaths = new Set(dirtyFiles.filter(f => !failed.includes(getFileName(f.path))).map(f => f.path));
-          for (const f of openFiles) {
-            if (!f.isDirty || savedPaths.has(f.path)) {
-              closeFile(activeProjectId, f.path);
-            }
-          }
-          return;
-        }
-      }
-    }
-
-    for (const f of openFiles) {
-      closeFile(activeProjectId, f.path);
-    }
-  }, [activeProjectId, openFiles, saveFile, closeFile]);
+    await batchSaveAndClose(openFiles, '关闭全部');
+  }, [openFiles, batchSaveAndClose]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, filePath: string) => {
     e.preventDefault();

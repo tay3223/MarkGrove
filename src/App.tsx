@@ -4,7 +4,7 @@ import ProjectBar from './components/ProjectBar';
 import FileTree from './components/FileTree';
 import ContentArea from './components/ContentArea';
 import ToastContainer, { showToast } from './components/Toast';
-import ConfirmDialogContainer from './components/ConfirmDialog';
+import ConfirmDialogContainer, { choiceDialog } from './components/ConfirmDialog';
 import QuickOpen from './components/QuickOpen';
 import ConflictDiffPanel from './components/ConflictDiffPanel';
 import SnapshotHistoryPanel from './components/SnapshotHistoryPanel';
@@ -43,11 +43,39 @@ export default function App() {
     };
   }, [handleExternalFileChange]);
 
-  // Handle before close - flush pending saves
+  // Handle before close - flush pending saves, block close on failure
   useEffect(() => {
     window.api.onBeforeClose(async () => {
-      await flushAllSaves();
-      return true;
+      const result = await flushAllSaves();
+      if (result.failed === 0) return true;
+
+      // Some files failed to save - block close and offer choices
+      const failedNames = result.failedPaths.map(fp => {
+        const parts = fp.split(/[/\\]/);
+        return parts[parts.length - 1] || fp;
+      });
+      const choice = await choiceDialog({
+        title: '保存失败',
+        message: `以下 ${result.failed} 个文件保存失败：\n${failedNames.join('\n')}\n\n窗口将保持打开。你可以重试保存，或放弃未保存的修改并退出。`,
+        buttons: [
+          { label: '重试保存', value: 'retry', primary: true },
+          { label: '放弃并退出', value: 'discard', danger: true },
+          { label: '取消', value: 'cancel' },
+        ],
+      });
+
+      if (choice === 'retry') {
+        // Retry save
+        const retryResult = await flushAllSaves();
+        if (retryResult.failed === 0) return true;
+        // Still failing - stay open
+        showToast({ type: 'error', message: '仍有文件保存失败，窗口保持打开' });
+        return false;
+      }
+      if (choice === 'discard') {
+        return true; // User explicitly chose to discard unsaved changes
+      }
+      return false; // Cancel - keep window open
     });
   }, [flushAllSaves]);
 

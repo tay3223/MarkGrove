@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { Project, OpenFile, FileNode, ViewTab, SessionState, UndoEntry, FileSnapshot, SourcePositionRequest, ConflictDetail, MindmapNodeRequest } from '../types';
 import { showToast } from '../components/Toast';
+import { disposeModel } from '../components/SourceEditor';
 
 const MAX_UNDO_STEPS = 50;
 const MAX_SNAPSHOTS = 20;
@@ -52,7 +53,7 @@ interface AppState {
   updateFileContent: (projectId: string, filePath: string, content: string, source?: 'source' | 'mindmap') => void;
   markFileDirty: (projectId: string, filePath: string, dirty: boolean) => void;
   saveFile: (projectId: string, filePath: string, force?: boolean) => Promise<boolean>;
-  saveAllFiles: () => Promise<{ succeeded: number; failed: number }>;
+  saveAllFiles: () => Promise<{ succeeded: number; failed: number; failedPaths: string[] }>;
   refreshFileTree: (projectId: string) => Promise<void>;
   handleExternalFileChange: (filePath: string, projectPath: string) => Promise<void>;
   saveSession: () => Promise<void>;
@@ -61,13 +62,13 @@ interface AppState {
   canUndo: () => boolean;
   canRedo: () => boolean;
   takeSnapshot: (filePath: string, content: string, source?: 'auto' | 'conflict-backup' | 'manual', label?: string) => void;
-  flushAllSaves: () => Promise<void>;
+  flushAllSaves: () => Promise<{ succeeded: number; failed: number; failedPaths: string[] }>;
   resolveConflict: (projectId: string, filePath: string, resolution: 'keep-local' | 'use-external') => Promise<void>;
   requestSourcePosition: (req: SourcePositionRequest) => void;
   clearSourcePosition: () => void;
   requestMindmapNode: (req: MindmapNodeRequest) => void;
   clearMindmapNode: () => void;
-  restoreSnapshot: (snapshot: FileSnapshot) => void;
+  restoreSnapshot: (snapshot: FileSnapshot) => boolean;
   /** Unified conflict protection: check for external modification and enter conflict state if needed.
    *  Returns true if save should proceed, false if blocked by conflict. */
   checkConflictBeforeSave: (projectId: string, filePath: string) => Promise<boolean>;
@@ -78,8 +79,8 @@ interface AppState {
   toggleSnapshotHistory: () => void;
   /** Queue a debounced save for a file (replaces component-level timers) */
   queueSave: (projectId: string, filePath: string) => void;
-  /** Flush all pending debounced saves immediately */
-  flushPendingSaves: () => Promise<void>;
+  /** Flush all pending debounced saves immediately. Returns save results with failed file paths. */
+  flushPendingSaves: () => Promise<{ succeeded: number; failed: number; failedPaths: string[] }>;
 }
 
 function generateId(): string {
@@ -291,6 +292,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         isDirty: false,
         savedContent: result.content!,
         diskMtime: result.mtime,
+        contentHash: computeHash(result.content!),
         saveState: 'saved',
       };
       set(s => {
@@ -316,6 +318,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   closeFile: (projectId, filePath) => {
+    // Dispose Monaco model for the closed file
+    disposeModel(projectId, filePath);
     set(s => {
       const files = (s.openFiles[projectId] || []).filter(f => f.path !== filePath);
       const activeFile = s.activeFilePath[projectId] === filePath
@@ -532,24 +536,33 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   saveAllFiles: async () => {
     const s = get();
-    const promises: Promise<boolean>[] = [];
+    const promises: Array<{ filePath: string; promise: Promise<boolean> }> = [];
     for (const [pid, files] of Object.entries(s.openFiles)) {
       for (const f of files) {
         if (f.isDirty) {
-          promises.push(get().saveFile(pid, f.path));
+          promises.push({ filePath: f.path, promise: get().saveFile(pid, f.path) });
         }
       }
     }
-    const results = await Promise.all(promises);
-    const succeeded = results.filter(Boolean).length;
-    const failed = results.filter(r => !r).length;
+    const results = await Promise.all(promises.map(p => p.promise));
+    const failedPaths: string[] = [];
+    let succeeded = 0;
+    for (let i = 0; i < results.length; i++) {
+      if (results[i]) {
+        succeeded++;
+      } else {
+        failedPaths.push(promises[i].filePath);
+      }
+    }
+    const failed = failedPaths.length;
     if (failed > 0) {
       showToast({
         type: 'warning',
         message: `保存完成: ${succeeded} 成功, ${failed} 失败`,
+        detail: failedPaths.map(fp => getFileName(fp)).join(', '),
       });
     }
-    return { succeeded, failed };
+    return { succeeded, failed, failedPaths };
   },
 
   refreshFileTree: async (projectId) => {
@@ -766,20 +779,21 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   restoreSnapshot: (snapshot) => {
     const s = get();
-    const pid = s.activeProjectId;
-    if (!pid) return;
-    // Find the file in open files
-    const file = s.openFiles[pid]?.find(f => f.path === snapshot.filePath);
-    if (file) {
-      get().updateFileContent(pid, snapshot.filePath, snapshot.content, 'source');
-      showToast({ type: 'success', message: `已恢复快照: ${getFileName(snapshot.filePath)}` });
-    } else {
-      showToast({ type: 'warning', message: '文件未打开，无法恢复快照' });
-    }
+    // Use snapshot's projectId, falling back to active project
+    const targetPid = snapshot.projectId || s.activeProjectId;
+    if (!targetPid) return false;
+    // Verify the target project still exists
+    const targetProject = s.projects.find(p => p.id === targetPid);
+    if (!targetProject) return false;
+    // Find the file in the target project's open files
+    const file = s.openFiles[targetPid]?.find(f => f.path === snapshot.filePath);
+    if (!file) return false;
+    get().updateFileContent(targetPid, snapshot.filePath, snapshot.content, 'source');
+    return true;
   },
 
   flushAllSaves: async () => {
-    await get().flushPendingSaves();
+    return get().flushPendingSaves();
   },
 
   requestSourcePosition: (req) => {
@@ -805,31 +819,71 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Already in conflict state
     if (file.conflictState === 'external-modified') return false;
 
-    // Only check dirty files with known mtime
-    if (!file.isDirty || !file.diskMtime) return true;
+    // Only check dirty files
+    if (!file.isDirty) return true;
 
-    const mtimeResult = await window.api.getFileMtime(filePath);
-    if (mtimeResult.error || !mtimeResult.mtime) return true; // can't check = allow
-
-    if (mtimeResult.mtime <= file.diskMtime) return true; // no external change
-
-    // External modification detected - read external content for diff
+    // Always read disk content for hash comparison - mtime is only a fast-path signal
     const readResult = await window.api.readFile(filePath);
-    const externalContent = readResult.error ? '' : (readResult.content || '');
+    if (readResult.error) {
+      // Cannot read disk - conservatively block save and show real error
+      showToast({
+        type: 'error',
+        message: `无法读取磁盘文件: ${getFileName(filePath)}`,
+        detail: `保存已被阻止。错误: ${readResult.error}`,
+        actions: [
+          {
+            label: '强制保存',
+            onClick: () => { get().saveFile(projectId, filePath, true); },
+          },
+        ],
+      });
+      return false;
+    }
 
-    // Double-check with content hash if mtime precision might be insufficient
-    const currentHash = computeHash(file.content);
+    const externalContent = readResult.content || '';
     const externalHash = computeHash(externalContent);
-    if (currentHash === externalHash && file.contentHash === externalHash) {
-      // Content is actually the same, just mtime changed - update mtime and proceed
-      set(s => ({
-        openFiles: {
-          ...s.openFiles,
-          [projectId]: (s.openFiles[projectId] || []).map(f =>
-            f.path === filePath ? { ...f, diskMtime: mtimeResult.mtime, contentHash: externalHash } : f
-          ),
-        },
-      }));
+
+    // Compare disk hash against baseline hash (recorded at open/last save)
+    // If we have a baseline hash, use it as the primary check
+    if (file.contentHash) {
+      if (externalHash === file.contentHash) {
+        // Disk content matches our baseline - no external change, safe to save
+        // Update mtime in case it drifted
+        if (readResult.mtime && readResult.mtime !== file.diskMtime) {
+          set(s => ({
+            openFiles: {
+              ...s.openFiles,
+              [projectId]: (s.openFiles[projectId] || []).map(f =>
+                f.path === filePath ? { ...f, diskMtime: readResult.mtime } : f
+              ),
+            },
+          }));
+        }
+        return true;
+      }
+      // Hash differs from baseline - external modification detected
+    } else if (file.diskMtime) {
+      // No baseline hash - fall back to mtime check
+      const mtimeResult = readResult.mtime;
+      if (!mtimeResult || mtimeResult <= file.diskMtime) {
+        return true; // no external change detected via mtime
+      }
+      // mtime increased - possible external change, but we already have the content
+      // Check if content actually matches what we last saved
+      if (file.savedContent && computeHash(file.savedContent) === externalHash) {
+        // Content matches last saved version, just mtime drift - update and proceed
+        set(s => ({
+          openFiles: {
+            ...s.openFiles,
+            [projectId]: (s.openFiles[projectId] || []).map(f =>
+              f.path === filePath ? { ...f, diskMtime: mtimeResult, contentHash: externalHash } : f
+            ),
+          },
+        }));
+        return true;
+      }
+    } else {
+      // No baseline at all - cannot determine conflict, allow save
       return true;
     }
 
@@ -839,7 +893,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       localContent: file.content,
       externalContent,
       localMtime: file.diskMtime,
-      externalMtime: mtimeResult.mtime,
+      externalMtime: readResult.mtime,
     };
 
     set(s => ({
@@ -911,7 +965,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     pendingSaveTimers.clear();
 
-    // Save all dirty files
-    await get().saveAllFiles();
+    // Save all dirty files and return detailed results
+    return get().saveAllFiles();
   },
 }));

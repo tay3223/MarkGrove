@@ -70,17 +70,28 @@ export default function SearchPanel({ visible, onClose }: SearchPanelProps) {
     }
   }, [performSearch, onClose]);
 
-  const handleResultClick = useCallback((filePath: string, line: number) => {
+  const handleResultClick = useCallback(async (filePath: string, line: number) => {
     if (!activeProjectId) return;
-    openFile(activeProjectId, filePath);
-    requestSourcePosition({
-      filePath,
-      projectId: activeProjectId,
-      startLine: line,
-      endLine: line,
-    });
-    setActiveTab('source');
-    onClose();
+    try {
+      await openFile(activeProjectId, filePath);
+      // Verify the file was actually opened
+      const opened = useAppStore.getState().openFiles[activeProjectId]?.find(f => f.path === filePath);
+      if (!opened) {
+        showToast({ type: 'error', message: `无法打开文件: ${getFileName(filePath)}` });
+        return; // Keep panel open, don't leave stale pending request
+      }
+      // File opened successfully - now safe to request position and switch tab
+      requestSourcePosition({
+        filePath,
+        projectId: activeProjectId,
+        startLine: line,
+        endLine: line,
+      });
+      setActiveTab('source');
+      onClose();
+    } catch (err: any) {
+      showToast({ type: 'error', message: `打开文件失败: ${getFileName(filePath)}`, detail: err?.message });
+    }
   }, [activeProjectId, openFile, requestSourcePosition, setActiveTab, onClose]);
 
   const toggleFile = useCallback((filePath: string) => {

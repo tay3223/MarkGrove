@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld('api', {
   getProjectName: (path) => ipcRenderer.invoke('get-project-name', path),
   showItemInFolder: (path) => ipcRenderer.invoke('show-item-in-folder', path),
   getDirName: (path) => ipcRenderer.invoke('get-dir-name', path),
+  resolvePath: (baseDir, relativePath) => ipcRenderer.invoke('resolve-path', baseDir, relativePath),
+  openExternal: (url) => ipcRenderer.invoke('open-external', url),
   getSnapshots: () => ipcRenderer.invoke('get-snapshots'),
   saveSnapshots: (snapshots) => ipcRenderer.invoke('save-snapshots', snapshots),
   searchInFiles: (projectPath, query) => ipcRenderer.invoke('search-in-files', projectPath, query),

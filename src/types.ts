@@ -150,6 +150,8 @@ declare global {
       getProjectName: (path: string) => Promise<string>;
       showItemInFolder: (path: string) => Promise<void>;
       getDirName: (path: string) => Promise<string>;
+      resolvePath: (baseDir: string, relativePath: string) => Promise<{ resolved?: string; error?: string }>;
+      openExternal: (url: string) => Promise<void>;
       getSnapshots: () => Promise<FileSnapshot[]>;
       saveSnapshots: (snapshots: FileSnapshot[]) => Promise<void>;
       searchInFiles: (projectPath: string, query: string) => Promise<{ results?: SearchResult[]; error?: string }>;

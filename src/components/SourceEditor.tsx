@@ -2,6 +2,36 @@ import { useEffect, useRef } from 'react';
 import * as monaco from 'monaco-editor';
 import { useAppStore } from '../stores/appStore';
 
+/** Per-file Monaco models keyed by `projectId:filePath` */
+const models = new Map<string, monaco.editor.ITextModel>();
+/** Per-file view states keyed by `projectId:filePath` */
+const viewStates = new Map<string, monaco.editor.ICodeEditorViewState | null>();
+
+function modelKey(projectId: string, filePath: string): string {
+  return `${projectId}:${filePath}`;
+}
+
+function getOrCreateModel(projectId: string, filePath: string, content: string): monaco.editor.ITextModel {
+  const key = modelKey(projectId, filePath);
+  let model = models.get(key);
+  if (!model || model.isDisposed()) {
+    model = monaco.editor.createModel(content, 'markdown');
+    models.set(key, model);
+  }
+  return model;
+}
+
+/** Dispose model for a closed file to avoid memory leaks */
+export function disposeModel(projectId: string, filePath: string) {
+  const key = modelKey(projectId, filePath);
+  const model = models.get(key);
+  if (model && !model.isDisposed()) {
+    model.dispose();
+  }
+  models.delete(key);
+  viewStates.delete(key);
+}
+
 export default function SourceEditor() {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -34,14 +64,17 @@ export default function SourceEditor() {
     requestMindmapNode: useAppStore.getState().requestMindmapNode,
   };
 
+  // Track previous file key for view state save/restore
+  const prevFileKeyRef = useRef<string | null>(null);
+
   // Debounce cursor position changes for mindmap sync
   const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Create editor
+  // Create editor (no default model - we set per-file models)
   useEffect(() => {
     if (!containerRef.current) return;
     const editor = monaco.editor.create(containerRef.current, {
-      value: '',
+      model: null, // Start with no model
       language: 'markdown',
       theme: 'vs-dark',
       automaticLayout: true,
@@ -62,7 +95,6 @@ export default function SourceEditor() {
       const { activeProjectId: pid, activeFilePath: fp, updateFileContent, queueSave } = latestRef.current;
       if (!pid || !fp || loadingRef.current) return;
       updateFileContent(pid, fp, editor.getValue());
-      // Use store-level debounced save queue instead of component-level timer
       queueSave(pid, fp);
     });
 
@@ -70,7 +102,6 @@ export default function SourceEditor() {
     const cursorSub = editor.onDidChangeCursorPosition((e) => {
       const { activeProjectId: pid, activeFilePath: fp, requestMindmapNode } = latestRef.current;
       if (!pid || !fp || loadingRef.current) return;
-      // Debounce cursor changes to avoid excessive mindmap updates
       if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current);
       cursorTimerRef.current = setTimeout(() => {
         cursorTimerRef.current = null;
@@ -82,43 +113,74 @@ export default function SourceEditor() {
       sub.dispose();
       cursorSub.dispose();
       if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current);
+      // Save view state for current file before disposing
+      if (prevFileKeyRef.current && editor) {
+        try {
+          viewStates.set(prevFileKeyRef.current, editor.saveViewState());
+        } catch { /* ignore */ }
+      }
       editor.dispose();
       editorRef.current = null;
     };
   }, []);
 
-  // Sync content when file changes
+  // Sync model and view state when file changes
   useEffect(() => {
     const editor = editorRef.current;
-    if (!editor || !activeFile) return;
-    if (editor.getValue() !== activeFile.content) {
+    if (!editor || !activeFile || !activeProjectId || !activeFilePath) return;
+
+    const key = modelKey(activeProjectId, activeFilePath);
+
+    // Save view state for previous file
+    if (prevFileKeyRef.current && prevFileKeyRef.current !== key) {
+      try {
+        viewStates.set(prevFileKeyRef.current, editor.saveViewState());
+      } catch { /* ignore */ }
+    }
+
+    // Get or create per-file model
+    const model = getOrCreateModel(activeProjectId, activeFilePath, activeFile.content);
+
+    // Sync content if model was just created with different content
+    if (model.getValue() !== activeFile.content) {
       loadingRef.current = true;
-      editor.setValue(activeFile.content);
+      model.setValue(activeFile.content);
       loadingRef.current = false;
     }
-  }, [activeFile?.path, activeFile?.content]);
+
+    // Set model on editor
+    if (editor.getModel() !== model) {
+      editor.setModel(model);
+    }
+
+    // Restore view state for this file
+    const savedViewState = viewStates.get(key);
+    if (savedViewState) {
+      try {
+        editor.restoreViewState(savedViewState);
+      } catch { /* ignore */ }
+    }
+
+    prevFileKeyRef.current = key;
+  }, [activeFile?.path, activeFile?.content, activeProjectId, activeFilePath]);
 
   // Consume pending source position from store (mindmap → source navigation)
   useEffect(() => {
     if (!pendingSourcePosition || !editorRef.current) return;
-    // Only consume if this is for the current file
     if (pendingSourcePosition.filePath !== activeFilePath) return;
 
     const editor = editorRef.current;
     const { startLine, endLine } = pendingSourcePosition;
 
-    // Validate line numbers
     const model = editor.getModel();
     if (!model) return;
     const totalLines = model.getLineCount();
     const safeLine = Math.min(Math.max(1, startLine), totalLines);
     const safeEndLine = Math.min(Math.max(safeLine, endLine || startLine), totalLines);
 
-    // Scroll to line and highlight
     editor.revealLineInCenter(safeLine);
     editor.setPosition({ lineNumber: safeLine, column: 1 });
 
-    // Highlight the range
     const decorations = editor.deltaDecorations(decorationsRef.current, [{
       range: new monaco.Range(safeLine, 1, safeEndLine, 1),
       options: {
@@ -129,14 +191,12 @@ export default function SourceEditor() {
     }]);
     decorationsRef.current = decorations;
 
-    // Clear highlight after 2 seconds
     setTimeout(() => {
       if (editorRef.current) {
         decorationsRef.current = editorRef.current.deltaDecorations(decorationsRef.current, []);
       }
     }, 2000);
 
-    // Consume the pending position
     clearSourcePosition();
   }, [pendingSourcePosition, activeFilePath, clearSourcePosition]);
 
