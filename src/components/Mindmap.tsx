@@ -118,10 +118,11 @@ export default function Mindmap({
   const astRef = useRef<any>(null);
   const mindmapRootRef = useRef<MindmapNode | null>(null);
   const fitFrameRef = useRef<number | null>(null);
-  const pendingFitFilePathRef = useRef<string | null>(null);
-  const pendingAutoFitFilePathRef = useRef<string | null>(null);
-  const lastFittedFilePathRef = useRef<string | null>(null);
-  const [, forceReadyRender] = useState(0);
+  const readyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Generation token to invalidate stale async callbacks (StrictMode, hot reload, unmount).
+  const generationRef = useRef(0);
+  // Explicit ready state: the single source of truth for mindmap visibility.
+  const [isMindmapReady, setMindmapReady] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<MindmapNode[]>([]);
   const [searchIndex, setSearchIndex] = useState(0);
@@ -160,23 +161,58 @@ export default function Mindmap({
   // Whether the current file is editable in mindmap (no front matter)
   const isMindmapEditable = activeFile ? !hasFrontMatter(activeFile.content) : false;
 
-  const scheduleFit = useCallback((filePath: string) => {
-    const me = meRef.current;
-    if (!me) return;
-    pendingFitFilePathRef.current = filePath;
+  // Schedule a deferred scaleFit after 2 animation frames so the DOM has time
+  // to lay out. Uses a generation token to ignore stale callbacks after
+  // cleanup / rebuild / unmount.
+  const scheduleFit = useCallback(() => {
+    const generation = generationRef.current;
     if (fitFrameRef.current !== null) cancelAnimationFrame(fitFrameRef.current);
     fitFrameRef.current = requestAnimationFrame(() => {
       fitFrameRef.current = requestAnimationFrame(() => {
-        if (pendingFitFilePathRef.current === filePath) {
-          meRef.current?.scaleFit();
-          lastFittedFilePathRef.current = filePath;
-          pendingAutoFitFilePathRef.current = null;
-          forceReadyRender(v => v + 1);
-          pendingFitFilePathRef.current = null;
-        }
         fitFrameRef.current = null;
+        if (generationRef.current !== generation) return; // stale callback
+        try {
+          meRef.current?.scaleFit();
+        } catch (err) {
+          console.warn('Mindmap scaleFit failed:', err);
+        }
+        setMindmapReady(true);
       });
     });
+  }, []);
+
+  // Fallback timeout to guarantee the mindmap becomes visible even if scaleFit
+  // never fires (e.g. container has zero size, rAF cancelled, etc.).
+  const ensureReadyTimeout = useCallback(() => {
+    const generation = generationRef.current;
+    if (readyTimeoutRef.current) clearTimeout(readyTimeoutRef.current);
+    readyTimeoutRef.current = setTimeout(() => {
+      readyTimeoutRef.current = null;
+      if (generationRef.current !== generation) return; // stale callback
+      setMindmapReady(true);
+    }, 400);
+  }, []);
+
+  // Manual "适应" handler: fit now and unconditionally show the mindmap so the
+  // user can always recover from a stuck/hidden state.
+  const handleFit = useCallback(() => {
+    if (fitFrameRef.current !== null) {
+      cancelAnimationFrame(fitFrameRef.current);
+      fitFrameRef.current = null;
+    }
+    if (readyTimeoutRef.current) {
+      clearTimeout(readyTimeoutRef.current);
+      readyTimeoutRef.current = null;
+    }
+    const me = meRef.current;
+    if (me) {
+      try {
+        me.scaleFit();
+      } catch (err) {
+        console.warn('Mindmap scaleFit failed:', err);
+      }
+    }
+    setMindmapReady(true);
   }, []);
 
   // Search functionality
@@ -331,10 +367,13 @@ export default function Mindmap({
             }
           } catch { /* ignore */ }
         }
+        // Content refresh keeps the instance alive; ensure the mindmap is visible.
+        setMindmapReady(true);
         return;
       }
 
       // Full rebuild: file switch or first render
+      setMindmapReady(false);
       mindmapRootRef.current = mindmapData;
 
       if (meRef.current) {
@@ -419,29 +458,39 @@ export default function Mindmap({
       meRef.current = me;
 
       if (shouldAutoFit) {
-        pendingAutoFitFilePathRef.current = activeFilePath || null;
-        scheduleFit(activeFilePath || '');
+        scheduleFit();
+        ensureReadyTimeout();
+      } else {
+        // Defensive: full-rebuild branch should always auto-fit, but never
+        // leave the mindmap permanently hidden.
+        setMindmapReady(true);
       }
     } catch (err) {
-      pendingAutoFitFilePathRef.current = null;
       console.error('Failed to build mindmap:', err);
       showToast({ type: 'error', message: '脑图构建失败', detail: String(err) });
+      // Show whatever state we're in instead of leaving a blank container.
+      setMindmapReady(true);
     }
-  }, [fileName, onMindmapRoot, onSelectNode, scheduleFit, goToSource, activeFilePath, collectExpandedIds, applyExpandedState]);
+  }, [fileName, onMindmapRoot, onSelectNode, scheduleFit, ensureReadyTimeout, goToSource, collectExpandedIds, applyExpandedState]);
 
   useEffect(() => {
     if (activeFile?.content !== undefined) {
-      const isFileSwitch = activeFilePath !== lastContentFilePathRef.current;
+      // A full (re)build is needed when there is no instance yet, or when the
+      // active file has changed. Otherwise it's a content update (debounced).
+      // Checking meRef.current is critical for React StrictMode: after cleanup
+      // destroys the instance, the second effect run must re-initialize even
+      // though lastContentFilePathRef may still hold the same path.
+      const needsInitialBuild =
+        !meRef.current || activeFilePath !== lastContentFilePathRef.current;
       lastContentFilePathRef.current = activeFilePath || null;
 
-      if (isFileSwitch) {
-        // File switch: rebuild immediately with auto-fit
+      if (needsInitialBuild) {
+        // File switch or first render: rebuild immediately with auto-fit
         if (rebuildTimerRef.current) {
           clearTimeout(rebuildTimerRef.current);
           rebuildTimerRef.current = null;
         }
-        const shouldAutoFit = activeFilePath !== lastFittedFilePathRef.current;
-        rebuildMindmap(activeFile.content, shouldAutoFit);
+        rebuildMindmap(activeFile.content, true);
       } else {
         // Content change: debounce rebuild to avoid destroying mindmap during typing
         if (rebuildTimerRef.current) clearTimeout(rebuildTimerRef.current);
@@ -455,19 +504,26 @@ export default function Mindmap({
 
   useEffect(() => {
     return () => {
+      // Invalidate all pending async callbacks so stale rAF/timeout callbacks
+      // won't write state after the component (or instance) is gone.
+      generationRef.current += 1;
       if (fitFrameRef.current !== null) {
         cancelAnimationFrame(fitFrameRef.current);
         fitFrameRef.current = null;
       }
-      pendingFitFilePathRef.current = null;
-      pendingAutoFitFilePathRef.current = null;
-      lastFittedFilePathRef.current = null;
-      dblclickCleanupRef.current?.();
-      dblclickCleanupRef.current = null;
+      if (readyTimeoutRef.current) {
+        clearTimeout(readyTimeoutRef.current);
+        readyTimeoutRef.current = null;
+      }
       if (rebuildTimerRef.current) {
         clearTimeout(rebuildTimerRef.current);
         rebuildTimerRef.current = null;
       }
+      // Reset lifecycle ref so the next effect run treats itself as a fresh
+      // init instead of a "same-file content update" (critical for StrictMode).
+      lastContentFilePathRef.current = null;
+      dblclickCleanupRef.current?.();
+      dblclickCleanupRef.current = null;
       if (meRef.current) {
         meRef.current.destroy();
         meRef.current = null;
@@ -514,6 +570,42 @@ export default function Mindmap({
     clearMindmapNode();
   }, [pendingMindmapNode, activeFilePath, clearMindmapNode, onSelectNode]);
 
+  // Export current mindmap as PNG or SVG via native save dialog
+  const handleExport = useCallback(async () => {
+    const me = meRef.current;
+    if (!me) return;
+    const baseName = fileName.replace(/\.(md|markdown|mdown|mkd)$/i, '');
+    const savePath = await window.api.showSaveDialog({
+      title: '导出脑图',
+      defaultPath: `${baseName}.png`,
+      filters: [
+        { name: 'PNG 图片', extensions: ['png'] },
+        { name: 'SVG 矢量图', extensions: ['svg'] },
+      ],
+    });
+    if (!savePath) return; // user canceled
+
+    try {
+      const ext = savePath.toLowerCase().split('.').pop();
+      if (ext === 'svg') {
+        const blob = me.exportSvg?.();
+        if (!blob) throw new Error('SVG 导出失败');
+        const text = await blob.text();
+        const res = await window.api.writeExportFile(savePath, text);
+        if (res.error) throw new Error(res.error);
+      } else {
+        const blob = await me.exportPng?.();
+        if (!blob) throw new Error('PNG 导出失败');
+        const buf = await blob.arrayBuffer();
+        const res = await window.api.writeExportFile(savePath, buf);
+        if (res.error) throw new Error(res.error);
+      }
+      showToast({ type: 'success', message: '已导出', detail: savePath, duration: 2500 });
+    } catch (err) {
+      showToast({ type: 'error', message: '导出失败', detail: String(err) });
+    }
+  }, [fileName]);
+
   if (!activeFile) {
     return (
       <div className="empty-state">
@@ -522,12 +614,6 @@ export default function Mindmap({
       </div>
     );
   }
-
-  const shouldHideMindmap = activeFilePath !== null
-    && (
-      activeFilePath === pendingAutoFitFilePathRef.current
-      || activeFilePath !== lastFittedFilePathRef.current
-    );
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
@@ -580,27 +666,15 @@ export default function Mindmap({
           }}
           title="放大"
         >＋</button>
-        <button onClick={() => meRef.current?.scaleFit()}>适应</button>
-        <button onClick={() => {
-          if (meRef.current) {
-            const svg = meRef.current.exportSvg?.();
-            if (svg) {
-              const url = URL.createObjectURL(svg);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = `${fileName.replace(/\.(md|markdown)$/i, '')}.svg`;
-              a.click();
-              URL.revokeObjectURL(url);
-            }
-          }
-        }}>导出</button>
+        <button onClick={handleFit} title="适应窗口">适应</button>
+        <button onClick={handleExport} title="导出为 PNG 或 SVG">导出</button>
       </div>
       <div
         className="mindmap-container"
         ref={containerRef}
         style={{
-          visibility: shouldHideMindmap ? 'hidden' : 'visible',
-          pointerEvents: shouldHideMindmap ? 'none' : 'auto',
+          visibility: isMindmapReady ? 'visible' : 'hidden',
+          pointerEvents: isMindmapReady ? 'auto' : 'none',
         }}
       />
     </div>

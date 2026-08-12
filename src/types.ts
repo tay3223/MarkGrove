@@ -59,6 +59,8 @@ export interface MindmapNode {
     background?: string;
     fontWeight?: string;
     border?: string;
+    borderLeft?: string;
+    paddingLeft?: string;
     textDecoration?: string;
     width?: string;
   };
@@ -66,11 +68,15 @@ export interface MindmapNode {
     sourcePosition?: any;
     codeContent?: string;
     codeLang?: string;
-    nodeType?: 'heading' | 'list' | 'code' | 'root' | 'table' | 'image' | 'html' | 'thematicBreak' | 'footnote' | 'frontmatter' | 'unknown';
+    nodeType?: 'heading' | 'list' | 'code' | 'root' | 'table' | 'tablerow' | 'paragraph' | 'blockquote' | 'image' | 'html' | 'thematicBreak' | 'footnote' | 'frontmatter' | 'unknown';
     headingLevel?: number;
     description?: string;
+    fullText?: string;
     firstLine?: string;
     lineRange?: string;
+    cells?: string[];
+    headers?: string[];
+    rows?: string[][];
   };
 }
 
@@ -152,6 +158,12 @@ declare global {
       getDirName: (path: string) => Promise<string>;
       resolvePath: (baseDir: string, relativePath: string) => Promise<{ resolved?: string; error?: string }>;
       openExternal: (url: string) => Promise<void>;
+      showSaveDialog: (options: {
+        title?: string;
+        defaultPath?: string;
+        filters?: Array<{ name: string; extensions: string[] }>;
+      }) => Promise<string | null>;
+      writeExportFile: (path: string, data: ArrayBuffer | string) => Promise<{ success?: boolean; error?: string }>;
       getSnapshots: () => Promise<FileSnapshot[]>;
       saveSnapshots: (snapshots: FileSnapshot[]) => Promise<void>;
       searchInFiles: (projectPath: string, query: string) => Promise<{ results?: SearchResult[]; error?: string }>;

@@ -9,5 +9,5 @@ output/
 .env
 .env.*
 !.env.example
-_issues
+_*
 .qoder

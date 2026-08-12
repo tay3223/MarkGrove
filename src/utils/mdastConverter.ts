@@ -89,7 +89,6 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
   };
 
   const headingStack: Array<{ level: number; node: MindmapNode }> = [];
-  let currentParent = root;
   let listStack: Array<{ node: MindmapNode; depth: number }> = [];
 
   // Build structural path from heading stack
@@ -97,13 +96,32 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
     return headingStack.map(h => h.node.id).join('/');
   }
 
+  // Append paragraph text to a heading's description (for AuxPanel "正文摘要")
+  function appendDescription(node: MindmapNode, text: string) {
+    const desc = node.data?.description;
+    node.data = {
+      ...node.data,
+      description: desc ? `${desc}\n${text}` : text,
+    };
+  }
+
+  // Truncate long text for mindmap node topics to keep nodes readable
+  function truncateTopic(text: string, maxLen = 120): string {
+    if (text.length <= maxLen) return text;
+    return text.slice(0, maxLen) + '…';
+  }
+
   for (const child of ast.children) {
     if (child.type === 'heading') {
       const text = extractText(child);
       const level = child.depth;
 
-      // Pop BEFORE computing parent so same-level headings share 'root' or the
-      // correct ancestor as parent identity
+      // Pop headings of equal or deeper level so that the new heading attaches
+      // to its correct ancestor. E.g. when stack is [root→H1→H2] and we see a
+      // new H2, pop H2 then attach to H1; when we see a new H1, pop both H2
+      // and H1 then attach to root. This faithfully mirrors Markdown's native
+      // heading hierarchy: H1 = level-1 child of root, H2 = child of the
+      // preceding H1, H3 = child of the preceding H2, etc.
       while (headingStack.length > 0 && headingStack[headingStack.length - 1].level >= level) {
         headingStack.pop();
       }
@@ -127,7 +145,6 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       parent.children = parent.children || [];
       parent.children.push(node);
       headingStack.push({ level, node });
-      currentParent = node;
       listStack = [];
     } else if (child.type === 'list') {
       const parent = headingStack.length > 0
@@ -136,7 +153,6 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       const listNodes = convertListToNodes(child, currentPath());
       parent.children = parent.children || [];
       parent.children.push(...listNodes);
-      currentParent = parent;
       listStack = [];
     } else if (child.type === 'code') {
       const firstLine = (child.value || '').split('\n')[0]?.trim() || '';
@@ -164,25 +180,25 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
     } else if (child.type === 'paragraph') {
       const text = extractText(child);
       if (text.trim()) {
-        if (currentParent !== root) {
-          const desc = currentParent.data?.description;
-          currentParent.data = {
-            ...currentParent.data,
-            description: desc ? `${desc}\n${text}` : text,
-          };
-        } else {
-          const paraNode: MindmapNode = {
-            topic: text,
-            id: structuralId('paragraph', text, ''),
-            children: [],
-            data: {
-              nodeType: 'list',
-              sourcePosition: child.position,
-            },
-          };
-          root.children = root.children || [];
-          root.children.push(paraNode);
-        }
+        const parent = headingStack.length > 0
+          ? headingStack[headingStack.length - 1].node
+          : root;
+        const paraNode: MindmapNode = {
+          topic: truncateTopic(text),
+          id: structuralId('paragraph', text, currentPath()),
+          children: [],
+          style: { fontSize: '12px', color: '#bac2de' },
+          data: {
+            nodeType: 'paragraph',
+            sourcePosition: child.position,
+            fullText: text,
+          },
+        };
+        parent.children = parent.children || [];
+        parent.children.push(paraNode);
+        // Also append to parent heading's description so AuxPanel shows
+        // the full paragraph text when the heading is selected.
+        appendDescription(parent, text);
       }
       listStack = [];
     } else if (child.type === 'blockquote') {
@@ -191,30 +207,68 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
         ? headingStack[headingStack.length - 1].node
         : root;
       const quoteNode: MindmapNode = {
-        topic: `> ${text}`,
+        topic: `> ${truncateTopic(text)}`,
         id: structuralId('blockquote', text, currentPath()),
         children: [],
+        style: { fontSize: '12px', color: '#a6adc8', borderLeft: '2px solid #6c7086', paddingLeft: '6px' },
         data: {
-          nodeType: 'list',
+          nodeType: 'blockquote',
           sourcePosition: child.position,
+          fullText: text,
         },
       };
       parent.children = parent.children || [];
       parent.children.push(quoteNode);
+      appendDescription(parent, `> ${text}`);
       listStack = [];
     } else if (child.type === 'table') {
       const parent = headingStack.length > 0
         ? headingStack[headingStack.length - 1].node
         : root;
+      // Extract rows from the mdast table (remark-gfm already strips the
+      // alignment separator row; children = headerRow + dataRows)
+      const rows: string[][] = (child.children || [])
+        .filter((r: any) => r.type === 'tableRow')
+        .map((r: any) =>
+          (r.children || [])
+            .filter((c: any) => c.type === 'tableCell')
+            .map((c: any) => extractText(c)),
+        );
+      const headerCells = rows.length > 0 ? rows[0] : [];
+      const dataRows = rows.slice(1);
+
+      // Build child nodes for each data row so table content is not lost.
+      const rowNodes: MindmapNode[] = dataRows.map((cells, idx) => {
+        // For 2-column (key-value) tables, use "key — value" format;
+        // for wider tables join with " | ".
+        const rowText = cells.length === 2
+          ? `${cells[0]}  —  ${cells[1]}`
+          : cells.join(' | ');
+        return {
+          topic: truncateTopic(rowText, 100),
+          id: structuralId('tablerow', rowText + idx, currentPath()),
+          children: [],
+          style: { fontSize: '11px', color: '#a6adc8' },
+          data: {
+            nodeType: 'tablerow',
+            sourcePosition: child.position,
+            cells,
+            headers: headerCells,
+          },
+        };
+      });
+
       const tableNode: MindmapNode = {
         topic: '[表格]',
         id: structuralId('table', '', currentPath()),
-        children: [],
+        children: rowNodes,
         style: { fontSize: '12px', color: '#94e2d5', border: '1px dashed #94e2d5' },
         data: {
           nodeType: 'table',
           sourcePosition: child.position,
           lineRange: child.position ? `${child.position.start.line}-${child.position.end.line}` : undefined,
+          headers: headerCells,
+          rows: dataRows,
         },
       };
       parent.children = parent.children || [];
@@ -239,21 +293,9 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       parent.children.push(htmlNode);
       listStack = [];
     } else if (child.type === 'thematicBreak') {
-      const parent = headingStack.length > 0
-        ? headingStack[headingStack.length - 1].node
-        : root;
-      const hrNode: MindmapNode = {
-        topic: '———',
-        id: structuralId('thematicBreak', '', currentPath()),
-        children: [],
-        style: { fontSize: '11px', color: '#6c7086' },
-        data: {
-          nodeType: 'thematicBreak',
-          sourcePosition: child.position,
-        },
-      };
-      parent.children = parent.children || [];
-      parent.children.push(hrNode);
+      // `---` separators are visual scaffolding in linear markdown and add
+      // no information in a radial mindmap. Skip them instead of creating a
+      // "———" child node that just adds noise.
       listStack = [];
     } else if (child.type === 'footnoteDefinition') {
       const parent = headingStack.length > 0

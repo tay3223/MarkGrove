@@ -338,6 +338,34 @@ ipcMain.handle('open-external', (_event, url) => {
   }
 });
 
+// Show a native save dialog and return the chosen path (or null if canceled)
+ipcMain.handle('show-save-dialog', async (_event, options) => {
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: options?.title || '保存',
+    defaultPath: options?.defaultPath,
+    filters: options?.filters || [{ name: 'All Files', extensions: ['*'] }],
+  });
+  if (result.canceled || !result.filePath) return null;
+  return result.filePath;
+});
+
+// Write exported image data to a user-chosen path.
+// Path is constrained to image extensions to prevent abuse.
+const EXPORT_ALLOWED_EXTS = new Set(['.png', '.svg', '.jpg', '.jpeg', '.webp']);
+ipcMain.handle('write-export-file', async (_event, filePath, data) => {
+  try {
+    const ext = path.extname(filePath).toLowerCase();
+    if (!EXPORT_ALLOWED_EXTS.has(ext)) {
+      return { error: '不支持的导出格式' };
+    }
+    const buffer = typeof data === 'string' ? data : Buffer.from(data);
+    await fs.writeFile(filePath, buffer);
+    return { success: true };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
 // Snapshot persistence
 ipcMain.handle('get-snapshots', () => {
   return snapshotStore.get('snapshots', []);

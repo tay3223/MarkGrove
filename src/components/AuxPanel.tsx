@@ -10,10 +10,16 @@ function getNodeTypeLabel(nodeType?: string): string {
     case 'heading': return 'H';
     case 'code': return '</>';
     case 'table': return '⊞';
+    case 'tablerow': return '⊞';
+    case 'paragraph': return '¶';
+    case 'blockquote': return '❝';
     case 'image': return '🖼';
     case 'html': return '<>';
     case 'thematicBreak': return '—';
     case 'footnote': return '[^]';
+    case 'frontmatter': return '---';
+    case 'list': return '•';
+    case 'root': return '●';
     case 'unknown': return '?';
     default: return '•';
   }
@@ -26,10 +32,14 @@ function getNodeTypeName(nodeType?: string): string {
     case 'list': return '列表项';
     case 'root': return '根节点';
     case 'table': return '表格';
+    case 'tablerow': return '表格行';
+    case 'paragraph': return '段落';
+    case 'blockquote': return '引用';
     case 'image': return '图片';
     case 'html': return 'HTML';
     case 'thematicBreak': return '分隔线';
     case 'footnote': return '脚注';
+    case 'frontmatter': return 'Front Matter';
     case 'unknown': return '未识别';
     default: return nodeType || '—';
   }
