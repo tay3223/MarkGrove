@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm';
 import remarkRehype from 'remark-rehype';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeStringify from 'rehype-stringify';
+import DOMPurify from 'dompurify';
 import { useAppStore } from '../stores/appStore';
 import 'prismjs/themes/prism-tomorrow.css';
 
@@ -26,7 +27,23 @@ export default function Preview() {
         .use(rehypeHighlight)
         .use(rehypeStringify)
         .processSync(activeFile.content);
-      return String(result);
+      const rawHtml = String(result);
+      // Sanitize HTML to prevent XSS
+      return DOMPurify.sanitize(rawHtml, {
+        ALLOWED_TAGS: [
+          'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+          'p', 'a', 'ul', 'ol', 'li', 'blockquote',
+          'pre', 'code', 'em', 'strong', 'del',
+          'table', 'thead', 'tbody', 'tr', 'th', 'td',
+          'img', 'hr', 'br', 'span', 'div',
+          'sup', 'sub', 'input', 'label',
+        ],
+        ALLOWED_ATTR: [
+          'href', 'src', 'alt', 'title', 'class', 'id',
+          'type', 'checked', 'disabled', 'readonly',
+        ],
+        ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|tel):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
+      });
     } catch {
       return '<p>预览渲染失败</p>';
     }

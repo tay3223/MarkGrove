@@ -26,7 +26,9 @@
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
+    "@types/dompurify": "^3.0.5",
     "chokidar": "^4.0.0",
+    "dompurify": "^3.4.13",
     "electron-store": "^8.2.0",
     "mdast-util-to-markdown": "^2.1.0",
     "mind-elixir": "^5.0.0",

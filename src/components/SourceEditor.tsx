@@ -1,13 +1,13 @@
 import { useEffect, useRef } from 'react';
 import * as monaco from 'monaco-editor';
 import { useAppStore } from '../stores/appStore';
-import type { OpenFile } from '../types';
 
 export default function SourceEditor() {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loadingRef = useRef(false);
+  const decorationsRef = useRef<string[]>([]);
 
   const activeProjectId = useAppStore(s => s.activeProjectId);
   const activeFilePath = useAppStore(s => activeProjectId ? s.activeFilePath[activeProjectId] : null);
@@ -22,7 +22,7 @@ export default function SourceEditor() {
     activeProjectId: string | null;
     activeFilePath: string | null;
     updateFileContent: (pid: string, fp: string, content: string) => void;
-    saveFile: (pid: string, fp: string) => Promise<void>;
+    saveFile: (pid: string, fp: string) => Promise<boolean>;
   }>({} as any);
   latestRef.current = {
     activeProjectId,
@@ -31,6 +31,7 @@ export default function SourceEditor() {
     saveFile: useAppStore.getState().saveFile,
   };
 
+  // Create editor
   useEffect(() => {
     if (!containerRef.current) return;
     const editor = monaco.editor.create(containerRef.current, {
@@ -69,6 +70,7 @@ export default function SourceEditor() {
     };
   }, []);
 
+  // Sync content when file changes
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor || !activeFile) return;
@@ -77,7 +79,42 @@ export default function SourceEditor() {
       editor.setValue(activeFile.content);
       loadingRef.current = false;
     }
-  }, [activeFile?.path]);
+  }, [activeFile?.path, activeFile?.content]);
+
+  // Listen for mindmap-goto-line events
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      const { line, endLine } = customEvent.detail;
+      const editor = editorRef.current;
+      if (!editor) return;
+
+      // Scroll to line and highlight
+      editor.revealLineInCenter(line);
+      editor.setPosition({ lineNumber: line, column: 1 });
+
+      // Highlight the range
+      const decorations = editor.deltaDecorations(decorationsRef.current, [{
+        range: new monaco.Range(line, 1, endLine || line, 1),
+        options: {
+          isWholeLine: true,
+          className: 'highlighted-line',
+          linesDecorationsClassName: 'highlighted-line-decoration',
+        },
+      }]);
+      decorationsRef.current = decorations;
+
+      // Clear highlight after 2 seconds
+      setTimeout(() => {
+        if (editorRef.current) {
+          decorationsRef.current = editorRef.current.deltaDecorations(decorationsRef.current, []);
+        }
+      }, 2000);
+    };
+
+    window.addEventListener('mindmap-goto-line', handler);
+    return () => window.removeEventListener('mindmap-goto-line', handler);
+  }, []);
 
   if (!activeFile) {
     return (

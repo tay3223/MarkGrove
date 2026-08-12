@@ -1,6 +1,7 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const Store = require('electron-store');
 const chokidar = require('chokidar');
 
@@ -10,6 +11,7 @@ const isDev = process.env.NODE_ENV === 'development';
 const watchers = new Map();
 
 let mainWindow = null;
+let allowClose = false;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -34,6 +36,20 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
+  mainWindow.on('close', (e) => {
+    if (!allowClose) {
+      e.preventDefault();
+      mainWindow.webContents.send('before-close-request');
+    }
+  });
+
+  ipcMain.on('before-close-confirmed', () => {
+    allowClose = true;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.close();
+    }
+  });
+
   if (isDev) {
     mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools({ mode: 'detach' });
@@ -47,6 +63,13 @@ const IGNORE_DIRS = new Set([
   '.next', '.nuxt', 'build', 'coverage', '__pycache__',
 ]);
 
+const MD_EXTENSIONS = new Set(['.md', '.markdown', '.mdown', '.mkd']);
+
+function isMarkdownFile(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return MD_EXTENSIONS.has(ext);
+}
+
 async function scanDirectory(dirPath, relativePath = '') {
   const entries = await fs.readdir(dirPath, { withFileTypes: true });
   const nodes = [];
@@ -59,7 +82,7 @@ async function scanDirectory(dirPath, relativePath = '') {
       if (children.length > 0) {
         nodes.push({ name: entry.name, path: fullPath, type: 'directory', children });
       }
-    } else if (entry.name.endsWith('.md') || entry.name.endsWith('.markdown')) {
+    } else if (isMarkdownFile(entry.name)) {
       const stat = await fs.stat(fullPath);
       nodes.push({ name: entry.name, path: fullPath, type: 'file', size: stat.size });
     }
@@ -83,7 +106,7 @@ function startWatcher(projectPath) {
     depth: 10,
   });
   watcher.on('all', (event, filePath) => {
-    if (!filePath.endsWith('.md') && !filePath.endsWith('.markdown')) return;
+    if (!isMarkdownFile(filePath)) return;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('file-changed', { event, path: filePath, projectPath });
     }
@@ -94,6 +117,18 @@ function startWatcher(projectPath) {
 function stopWatcher(projectPath) {
   const w = watchers.get(projectPath);
   if (w) { w.close(); watchers.delete(projectPath); }
+}
+
+// Validate that a file path is within one of the watched project directories
+function isPathInProject(filePath) {
+  for (const projectPath of watchers.keys()) {
+    const resolved = path.resolve(filePath);
+    const resolvedProject = path.resolve(projectPath);
+    if (resolved.startsWith(resolvedProject + path.sep) || resolved === resolvedProject) {
+      return true;
+    }
+  }
+  return false;
 }
 
 app.whenReady().then(() => {
@@ -120,6 +155,19 @@ ipcMain.handle('open-directory', async () => {
   return result.filePaths[0];
 });
 
+ipcMain.handle('open-file-dialog', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile'],
+    title: '打开 Markdown 文件',
+    filters: [
+      { name: 'Markdown', extensions: ['md', 'markdown', 'mdown', 'mkd'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return result.filePaths[0];
+});
+
 ipcMain.handle('scan-directory', async (_event, dirPath) => {
   try {
     return await scanDirectory(dirPath);
@@ -130,8 +178,12 @@ ipcMain.handle('scan-directory', async (_event, dirPath) => {
 
 ipcMain.handle('read-file', async (_event, filePath) => {
   try {
+    if (!isPathInProject(filePath)) {
+      return { error: '文件路径不在已打开的项目目录内' };
+    }
     const content = await fs.readFile(filePath, 'utf-8');
-    return { content };
+    const stat = await fs.stat(filePath);
+    return { content, mtime: stat.mtimeMs };
   } catch (err) {
     return { error: err.message };
   }
@@ -139,8 +191,38 @@ ipcMain.handle('read-file', async (_event, filePath) => {
 
 ipcMain.handle('write-file', async (_event, filePath, content) => {
   try {
+    if (!isPathInProject(filePath)) {
+      return { error: '文件路径不在已打开的项目目录内' };
+    }
     await fs.writeFile(filePath, content, 'utf-8');
-    return { success: true };
+    const stat = await fs.stat(filePath);
+    return { success: true, mtime: stat.mtimeMs };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('write-file-atomic', async (_event, filePath, content) => {
+  try {
+    if (!isPathInProject(filePath)) {
+      return { error: '文件路径不在已打开的项目目录内' };
+    }
+    const dir = path.dirname(filePath);
+    const base = path.basename(filePath);
+    const tmpPath = path.join(dir, `.${base}.tmp-${Date.now()}`);
+    await fs.writeFile(tmpPath, content, 'utf-8');
+    await fs.rename(tmpPath, filePath);
+    const stat = await fs.stat(filePath);
+    return { success: true, mtime: stat.mtimeMs };
+  } catch (err) {
+    return { error: err.message };
+  }
+});
+
+ipcMain.handle('get-file-mtime', async (_event, filePath) => {
+  try {
+    const stat = await fs.stat(filePath);
+    return { mtime: stat.mtimeMs };
   } catch (err) {
     return { error: err.message };
   }
@@ -164,4 +246,8 @@ ipcMain.handle('save-session', (_event, session) => {
 
 ipcMain.handle('get-project-name', (_event, projectPath) => {
   return path.basename(projectPath);
+});
+
+ipcMain.handle('show-item-in-folder', (_event, filePath) => {
+  shell.showItemInFolder(filePath);
 });

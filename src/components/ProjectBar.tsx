@@ -1,4 +1,5 @@
 import { useAppStore } from '../stores/appStore';
+import { confirmDialog } from './ConfirmDialog';
 
 export default function ProjectBar() {
   const projects = useAppStore(s => s.projects);
@@ -7,19 +8,29 @@ export default function ProjectBar() {
   const addProject = useAppStore(s => s.addProject);
   const removeProject = useAppStore(s => s.removeProject);
 
+  const handleRemoveProject = async (projectId: string, projectName: string) => {
+    const confirmed = await confirmDialog({
+      title: '关闭项目',
+      message: `确定要关闭项目 "${projectName}" 吗？`,
+      confirmLabel: '关闭',
+      danger: true,
+    });
+    if (confirmed) {
+      removeProject(projectId);
+    }
+  };
+
   return (
     <div className="project-bar">
       {projects.map(p => (
         <div
           key={p.id}
           className={`project-icon ${p.id === activeProjectId ? 'active' : ''}`}
-          title={p.name}
+          title={`${p.name}\n右键关闭项目`}
           onClick={() => setActiveProject(p.id)}
           onContextMenu={(e) => {
             e.preventDefault();
-            if (confirm(`关闭项目 "${p.name}"?`)) {
-              removeProject(p.id);
-            }
+            handleRemoveProject(p.id, p.name);
           }}
         >
           {p.name.charAt(0).toUpperCase()}

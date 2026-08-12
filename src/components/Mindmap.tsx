@@ -3,9 +3,9 @@ import MindElixir from 'mind-elixir';
 import { DARK_THEME } from 'mind-elixir';
 import type { MainLineParams, MindElixirInstance, SubLineParams } from 'mind-elixir';
 import { useAppStore } from '../stores/appStore';
-import { parseMarkdown, stringifyMarkdown, mdastToMindmap, applyMindmapOperation } from '../utils/mdastConverter';
+import { parseMarkdown, mdastToMindmap } from '../utils/mdastConverter';
 import type { MindmapNode } from '../types';
-import type { MindmapOperation } from '../utils/mdastConverter';
+import { showToast } from './Toast';
 
 const themeSpacing = {
   '--node-gap-x': '36px',
@@ -33,8 +33,6 @@ function orthogonalMainBranch({
 function orthogonalSubBranch(this: MindElixirInstance, {
   pT, pL, pW, pH, cT, cL, cW, cH, direction, isFirst,
 }: SubLineParams): string {
-  // SubLineParams 的宽度包含 me-parent 留给连线的水平 padding，
-  // 而一级节点被 mind-elixir 的高优先级样式取消了这层 padding。
   const nodeGap = Number.parseFloat(
     this.container.style.getPropertyValue('--node-gap-x'),
   ) || Number.parseFloat(themeSpacing['--node-gap-x']);
@@ -103,6 +101,11 @@ function enableLeftButtonPan(me: MindElixirInstance): () => void {
   };
 }
 
+// Check if content has front matter
+function hasFrontMatter(content: string): boolean {
+  return content.trimStart().startsWith('---');
+}
+
 export default function Mindmap({
   onMindmapRoot,
   onSelectNode,
@@ -114,13 +117,14 @@ export default function Mindmap({
   const meRef = useRef<any>(null);
   const astRef = useRef<any>(null);
   const mindmapRootRef = useRef<MindmapNode | null>(null);
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fitFrameRef = useRef<number | null>(null);
   const pendingFitFilePathRef = useRef<string | null>(null);
   const pendingAutoFitFilePathRef = useRef<string | null>(null);
   const lastFittedFilePathRef = useRef<string | null>(null);
   const [, forceReadyRender] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<MindmapNode[]>([]);
+  const [searchIndex, setSearchIndex] = useState(0);
 
   const activeProjectId = useAppStore(s => s.activeProjectId);
   const activeFilePath = useAppStore(s => activeProjectId ? s.activeFilePath[activeProjectId] : null);
@@ -130,20 +134,12 @@ export default function Mindmap({
     const fp = s.activeFilePath[pid];
     return s.openFiles[pid]?.find(f => f.path === fp) ?? null;
   });
-  const updateFileContent = useAppStore(s => s.updateFileContent);
-  const saveFile = useAppStore(s => s.saveFile);
-  const markFileDirty = useAppStore(s => s.markFileDirty);
+  const setActiveTab = useAppStore(s => s.setActiveTab);
 
-  const fileName = activeFilePath ? activeFilePath.split('/').pop() || '' : '';
+  const fileName = activeFilePath ? activeFilePath.split(/[/\\]/).pop() || '' : '';
 
-  const syncToFile = useCallback((newContent: string) => {
-    if (!activeProjectId || !activeFilePath) return;
-    updateFileContent(activeProjectId, activeFilePath, newContent);
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => {
-      saveFile(activeProjectId, activeFilePath);
-    }, 500);
-  }, [activeProjectId, activeFilePath, updateFileContent, saveFile]);
+  // Whether the current file is editable in mindmap (no front matter)
+  const isMindmapEditable = activeFile ? !hasFrontMatter(activeFile.content) : false;
 
   const scheduleFit = useCallback((filePath: string) => {
     const me = meRef.current;
@@ -164,13 +160,62 @@ export default function Mindmap({
     });
   }, []);
 
-  const handleOperation = useCallback((op: MindmapOperation) => {
-    if (!astRef.current || !mindmapRootRef.current || !activeFilePath) return;
-    const newAst = applyMindmapOperation(astRef.current, mindmapRootRef.current, op);
-    astRef.current = newAst;
-    const newContent = stringifyMarkdown(newAst);
-    syncToFile(newContent);
-  }, [activeFilePath, syncToFile]);
+  // Search functionality
+  const performSearch = useCallback((query: string) => {
+    if (!query.trim() || !mindmapRootRef.current) {
+      setSearchResults([]);
+      setSearchIndex(0);
+      return;
+    }
+    const q = query.toLowerCase();
+    const results: MindmapNode[] = [];
+    const walk = (node: MindmapNode) => {
+      if (node.topic.toLowerCase().includes(q)) {
+        results.push(node);
+      }
+      node.children?.forEach(walk);
+    };
+    walk(mindmapRootRef.current);
+    setSearchResults(results);
+    setSearchIndex(0);
+
+    // Highlight first result
+    if (results.length > 0 && meRef.current) {
+      try {
+        meRef.current.selectNode(results[0].id);
+      } catch { /* ignore */ }
+    }
+  }, []);
+
+  useEffect(() => {
+    performSearch(searchQuery);
+  }, [searchQuery, performSearch]);
+
+  const navigateSearch = useCallback((direction: 'next' | 'prev') => {
+    if (searchResults.length === 0) return;
+    const newIndex = direction === 'next'
+      ? (searchIndex + 1) % searchResults.length
+      : (searchIndex - 1 + searchResults.length) % searchResults.length;
+    setSearchIndex(newIndex);
+    if (meRef.current) {
+      try {
+        meRef.current.selectNode(searchResults[newIndex].id);
+      } catch { /* ignore */ }
+    }
+  }, [searchResults, searchIndex]);
+
+  // Navigate to source code for a node
+  const goToSource = useCallback((node: MindmapNode) => {
+    const pos = node.data?.sourcePosition;
+    if (pos) {
+      setActiveTab('source');
+      // The SourceEditor will handle scrolling to the line
+      // We use a custom event to communicate
+      window.dispatchEvent(new CustomEvent('mindmap-goto-line', {
+        detail: { line: pos.start.line, endLine: pos.end.line },
+      }));
+    }
+  }, [setActiveTab]);
 
   const rebuildMindmap = useCallback((content: string, shouldAutoFit: boolean) => {
     if (!containerRef.current) return;
@@ -188,8 +233,8 @@ export default function Mindmap({
       const me = new MindElixir({
         el: containerRef.current,
         direction: MindElixir.RIGHT,
-        draggable: true,
-        editable: true,
+        draggable: false,
+        editable: false,
         contextMenu: false,
         toolBar: false,
         keypress: true,
@@ -211,15 +256,10 @@ export default function Mindmap({
             '--selected': '#89b4fa',
             '--panel-bgcolor': '#181825',
             '--panel-color': '#a6adc8',
-            // 紧凑布局（间距值见模块顶层 themeSpacing，加进 useCallback 依赖以支持 HMR 热更新）
             ...themeSpacing,
           },
           generateMainBranch: orthogonalMainBranch,
           generateSubBranch: orthogonalSubBranch,
-        },
-        before: {
-          insertSibling: () => true,
-          addChild: () => true,
         },
       } as any);
 
@@ -241,38 +281,12 @@ export default function Mindmap({
           }
           return null;
         };
-        onSelectNode?.(findById(mindmapRootRef.current));
-      });
+        const found = findById(mindmapRootRef.current);
+        onSelectNode?.(found);
 
-      me.bus.addListener('operation', (operation: any) => {
-        if (!operation) return;
-        const name = operation.name;
-        const obj = operation.obj;
-
-        if (name === 'addChild') {
-          handleOperation({
-            type: 'addChild',
-            nodeId: obj?.id || '',
-            parentId: obj?.parent?.id || '',
-            newText: obj?.topic || 'New Node',
-          });
-        } else if (name === 'finishEdit') {
-          handleOperation({
-            type: 'editText',
-            nodeId: obj?.id || '',
-            newText: obj?.topic || '',
-          });
-        } else if (name === 'removeNode') {
-          handleOperation({
-            type: 'deleteNode',
-            nodeId: obj?.id || '',
-          });
-        } else if (name === 'moveNode') {
-          handleOperation({
-            type: 'moveNode',
-            nodeId: obj?.id || '',
-            newParentId: obj?.toParent?.id || '',
-          });
+        // Double click to go to source
+        if (found) {
+          goToSource(found);
         }
       });
 
@@ -285,8 +299,9 @@ export default function Mindmap({
     } catch (err) {
       pendingAutoFitFilePathRef.current = null;
       console.error('Failed to build mindmap:', err);
+      showToast({ type: 'error', message: '脑图构建失败', detail: String(err) });
     }
-  }, [fileName, handleOperation, onMindmapRoot, onSelectNode, orthogonalMainBranch, orthogonalSubBranch, scheduleFit, themeSpacing]);
+  }, [fileName, onMindmapRoot, onSelectNode, scheduleFit, goToSource, activeFilePath]);
 
   useEffect(() => {
     if (activeFile?.content !== undefined) {
@@ -331,23 +346,40 @@ export default function Mindmap({
       <div className="mindmap-toolbar">
         <span className="file-name">{fileName}</span>
         {activeFile.isDirty && <span className="dirty-dot" />}
+        {!isMindmapEditable && (
+          <span style={{ fontSize: '11px', color: 'var(--warning)', marginLeft: '8px' }}>
+            只读模式
+          </span>
+        )}
         <div style={{ flex: 1 }} />
-        <input
-          type="text"
-          placeholder="搜索节点..."
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          style={{
-            background: 'var(--bg-tertiary)',
-            border: '1px solid var(--border)',
-            color: 'var(--text-primary)',
-            padding: '3px 8px',
-            borderRadius: '4px',
-            fontSize: '12px',
-            width: '140px',
-            outline: 'none',
-          }}
-        />
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+          <input
+            type="text"
+            placeholder="搜索节点..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.shiftKey ? navigateSearch('prev') : navigateSearch('next');
+              }
+            }}
+            style={{
+              background: 'var(--bg-tertiary)',
+              border: '1px solid var(--border)',
+              color: 'var(--text-primary)',
+              padding: '3px 8px',
+              borderRadius: '4px',
+              fontSize: '12px',
+              width: '140px',
+              outline: 'none',
+            }}
+          />
+          {searchResults.length > 0 && (
+            <span style={{ fontSize: '11px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+              {searchIndex + 1}/{searchResults.length}
+            </span>
+          )}
+        </div>
         <button
           onClick={() => {
             const me = meRef.current;
@@ -370,7 +402,7 @@ export default function Mindmap({
               const url = URL.createObjectURL(svg);
               const a = document.createElement('a');
               a.href = url;
-              a.download = `${fileName.replace('.md', '')}.svg`;
+              a.download = `${fileName.replace(/\.(md|markdown)$/i, '')}.svg`;
               a.click();
               URL.revokeObjectURL(url);
             }

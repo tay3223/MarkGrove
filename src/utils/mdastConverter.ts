@@ -95,8 +95,10 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       currentParent = parent;
       listStack = [];
     } else if (child.type === 'code') {
+      const firstLine = (child.value || '').split('\n')[0]?.trim() || '';
+      const codeSummary = firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine;
       const codeNode: MindmapNode = {
-        topic: `[${child.lang || 'code'}]`,
+        topic: `[${child.lang || 'code'}] ${codeSummary}`,
         id: nextId(),
         children: [],
         style: { ...CODE_NODE_STYLE },
@@ -105,6 +107,8 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
           codeContent: child.value,
           codeLang: child.lang || 'text',
           sourcePosition: child.position,
+          firstLine: firstLine || undefined,
+          lineRange: child.position ? `${child.position.start.line}-${child.position.end.line}` : undefined,
         },
       };
       const parent = headingStack.length > 0
@@ -154,7 +158,78 @@ export function mdastToMindmap(ast: any, fileName: string): MindmapNode {
       parent.children = parent.children || [];
       parent.children.push(quoteNode);
       listStack = [];
+    } else if (child.type === 'table') {
+      const parent = headingStack.length > 0
+        ? headingStack[headingStack.length - 1].node
+        : root;
+      const tableNode: MindmapNode = {
+        topic: '[表格]',
+        id: nextId(),
+        children: [],
+        style: { fontSize: '12px', color: '#94e2d5', border: '1px dashed #94e2d5' },
+        data: {
+          nodeType: 'table',
+          sourcePosition: child.position,
+          lineRange: child.position ? `${child.position.start.line}-${child.position.end.line}` : undefined,
+        },
+      };
+      parent.children = parent.children || [];
+      parent.children.push(tableNode);
+      listStack = [];
+    } else if (child.type === 'html') {
+      const parent = headingStack.length > 0
+        ? headingStack[headingStack.length - 1].node
+        : root;
+      const htmlNode: MindmapNode = {
+        topic: '[HTML]',
+        id: nextId(),
+        children: [],
+        style: { fontSize: '12px', color: '#f38ba8', border: '1px dashed #f38ba8' },
+        data: {
+          nodeType: 'html',
+          sourcePosition: child.position,
+          lineRange: child.position ? `${child.position.start.line}-${child.position.end.line}` : undefined,
+        },
+      };
+      parent.children = parent.children || [];
+      parent.children.push(htmlNode);
+      listStack = [];
+    } else if (child.type === 'thematicBreak') {
+      const parent = headingStack.length > 0
+        ? headingStack[headingStack.length - 1].node
+        : root;
+      const hrNode: MindmapNode = {
+        topic: '———',
+        id: nextId(),
+        children: [],
+        style: { fontSize: '11px', color: '#6c7086' },
+        data: {
+          nodeType: 'thematicBreak',
+          sourcePosition: child.position,
+        },
+      };
+      parent.children = parent.children || [];
+      parent.children.push(hrNode);
+      listStack = [];
+    } else if (child.type === 'footnoteDefinition') {
+      const parent = headingStack.length > 0
+        ? headingStack[headingStack.length - 1].node
+        : root;
+      const fnNode: MindmapNode = {
+        topic: `[脚注: ${child.identifier || ''}]`,
+        id: nextId(),
+        children: [],
+        style: { fontSize: '11px', color: '#f9e2af' },
+        data: {
+          nodeType: 'footnote',
+          sourcePosition: child.position,
+        },
+      };
+      parent.children = parent.children || [];
+      parent.children.push(fnNode);
+      listStack = [];
     }
+    // Silently skip: yaml (front matter), definition, etc.
   }
 
   return root;

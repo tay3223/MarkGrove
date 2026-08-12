@@ -5,6 +5,36 @@ import type { MindmapNode } from '../types';
 
 type AuxTab = 'outline' | 'code' | 'props';
 
+function getNodeTypeLabel(nodeType?: string): string {
+  switch (nodeType) {
+    case 'heading': return 'H';
+    case 'code': return '</>';
+    case 'table': return '⊞';
+    case 'image': return '🖼';
+    case 'html': return '<>';
+    case 'thematicBreak': return '—';
+    case 'footnote': return '[^]';
+    case 'unknown': return '?';
+    default: return '•';
+  }
+}
+
+function getNodeTypeName(nodeType?: string): string {
+  switch (nodeType) {
+    case 'heading': return '标题';
+    case 'code': return '代码块';
+    case 'list': return '列表项';
+    case 'root': return '根节点';
+    case 'table': return '表格';
+    case 'image': return '图片';
+    case 'html': return 'HTML';
+    case 'thematicBreak': return '分隔线';
+    case 'footnote': return '脚注';
+    case 'unknown': return '未识别';
+    default: return nodeType || '—';
+  }
+}
+
 export default function AuxPanel({
   mindmapRoot,
   selectedNode,
@@ -52,17 +82,20 @@ export default function AuxPanel({
             {outlineItems.map(item => (
               <div
                 key={item.id}
-                className="outline-item"
+                className={`outline-item ${selectedNode?.id === item.id ? 'outline-item-selected' : ''}`}
                 style={{ paddingLeft: `${item.depth * 16 + 8}px` }}
                 onClick={() => {
+                  // Use Mind Elixir API to select and center node
                   const el = document.querySelector(`[data-nodeid="${item.id}"]`);
                   if (el) {
                     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    // Simulate click to select
+                    (el as HTMLElement).click();
                   }
                 }}
               >
                 <span className="outline-depth">
-                  {item.nodeType === 'heading' ? 'H' : item.nodeType === 'code' ? '</>' : '•'}
+                  {getNodeTypeLabel(item.nodeType)}
                 </span>
                 {item.topic}
               </div>
@@ -100,7 +133,7 @@ export default function AuxPanel({
                 </div>
                 <div className="prop-row">
                   <span className="prop-label">类型</span>
-                  <span className="prop-value">{selectedNode.data?.nodeType || '—'}</span>
+                  <span className="prop-value">{getNodeTypeName(selectedNode.data?.nodeType)}</span>
                 </div>
                 <div className="prop-row">
                   <span className="prop-label">层级</span>
@@ -115,6 +148,28 @@ export default function AuxPanel({
                     <span className="prop-label">行号</span>
                     <span className="prop-value">
                       {selectedNode.data.sourcePosition.start.line}–{selectedNode.data.sourcePosition.end.line}
+                    </span>
+                  </div>
+                )}
+                {selectedNode.data?.description && (
+                  <div style={{ padding: '8px', marginTop: '8px', borderTop: '1px solid var(--border)' }}>
+                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '4px' }}>正文摘要</div>
+                    <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>
+                      {selectedNode.data.description}
+                    </div>
+                  </div>
+                )}
+                {selectedNode.data?.codeLang && (
+                  <div className="prop-row">
+                    <span className="prop-label">语言</span>
+                    <span className="prop-value">{selectedNode.data.codeLang}</span>
+                  </div>
+                )}
+                {selectedNode.data?.firstLine && (
+                  <div className="prop-row">
+                    <span className="prop-label">首行</span>
+                    <span className="prop-value" style={{ fontSize: '11px', fontFamily: 'monospace' }}>
+                      {selectedNode.data.firstLine}
                     </span>
                   </div>
                 )}
@@ -137,6 +192,14 @@ export default function AuxPanel({
                   <span className="prop-label">字数</span>
                   <span className="prop-value">{activeFile.content.length}</span>
                 </div>
+                {activeFile.lastSavedAt && (
+                  <div className="prop-row">
+                    <span className="prop-label">保存时间</span>
+                    <span className="prop-value">
+                      {new Date(activeFile.lastSavedAt).toLocaleTimeString('zh-CN')}
+                    </span>
+                  </div>
+                )}
               </>
             )}
           </div>

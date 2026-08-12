@@ -4,7 +4,18 @@ import SourceEditor from './SourceEditor';
 import Preview from './Preview';
 import Mindmap from './Mindmap';
 import AuxPanel from './AuxPanel';
+import FileTabs from './FileTabs';
 import type { MindmapNode } from '../types';
+
+function getFileName(filePath: string): string {
+  const parts = filePath.split(/[/\\]/);
+  return parts[parts.length - 1] || filePath;
+}
+
+function formatTime(timestamp: number): string {
+  const d = new Date(timestamp);
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
 
 export default function ContentArea() {
   const activeTab = useAppStore(s => s.activeTab);
@@ -34,13 +45,27 @@ export default function ContentArea() {
         <div className="empty-state">
           <div className="empty-icon">📂</div>
           <div className="empty-text">从左侧文件树选择一个 Markdown 文件</div>
+          <div className="empty-text" style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+            或使用 Cmd/Ctrl+P 快速打开
+          </div>
         </div>
       </div>
     );
   }
 
+  const saveStatusText = activeFile.saveState === 'saving'
+    ? '保存中...'
+    : activeFile.saveState === 'error'
+      ? `保存失败: ${activeFile.saveError || '未知错误'}`
+      : activeFile.isDirty
+        ? '未保存'
+        : activeFile.lastSavedAt
+          ? `已保存 ${formatTime(activeFile.lastSavedAt)}`
+          : '';
+
   return (
     <div className="content-area">
+      <FileTabs />
       <div className="content-tabs">
         <div
           className={`content-tab ${activeTab === 'source' ? 'active' : ''}`}
@@ -63,13 +88,21 @@ export default function ContentArea() {
           {activeFile.isDirty && activeTab === 'mindmap' && <span className="dirty-dot" />}
         </div>
         <div style={{ flex: 1 }} />
+        <div className="save-status" style={{
+          padding: '4px 12px',
+          fontSize: '11px',
+          color: activeFile.saveState === 'error' ? 'var(--danger)' : 'var(--text-muted)',
+          alignSelf: 'center',
+        }}>
+          {saveStatusText}
+        </div>
         <div style={{
           padding: '4px 12px',
           fontSize: '11px',
           color: 'var(--text-muted)',
           alignSelf: 'center',
         }}>
-          {activeFile.path.split('/').pop()}
+          {getFileName(activeFile.path)}
           {activeFile.isDirty && <span style={{ color: 'var(--warning)', marginLeft: '4px' }}>●</span>}
         </div>
       </div>
