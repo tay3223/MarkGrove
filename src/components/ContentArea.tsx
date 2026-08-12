@@ -20,6 +20,7 @@ function formatTime(timestamp: number): string {
 export default function ContentArea() {
   const activeTab = useAppStore(s => s.activeTab);
   const setActiveTab = useAppStore(s => s.setActiveTab);
+  const toggleSnapshotHistory = useAppStore(s => s.toggleSnapshotHistory);
   const activeFile = useAppStore(s => {
     const pid = s.activeProjectId;
     if (!pid) return null;
@@ -88,6 +89,21 @@ export default function ContentArea() {
           {activeFile.isDirty && activeTab === 'mindmap' && <span className="dirty-dot" />}
         </div>
         <div style={{ flex: 1 }} />
+        <button
+          onClick={toggleSnapshotHistory}
+          title="文件历史快照"
+          style={{
+            background: 'none',
+            border: 'none',
+            color: 'var(--text-muted)',
+            cursor: 'pointer',
+            fontSize: '12px',
+            padding: '2px 8px',
+            alignSelf: 'center',
+          }}
+        >
+          历史
+        </button>
         <div className="save-status" style={{
           padding: '4px 12px',
           fontSize: '11px',

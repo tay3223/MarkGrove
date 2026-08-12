@@ -126,6 +126,17 @@ export default function Mindmap({
   const [searchResults, setSearchResults] = useState<MindmapNode[]>([]);
   const [searchIndex, setSearchIndex] = useState(0);
   const [selectedNode, setSelectedNode] = useState<MindmapNode | null>(null);
+  // Use ref to always have the latest selectedNode in DOM event handlers
+  const selectedNodeRef = useRef<MindmapNode | null>(null);
+  selectedNodeRef.current = selectedNode;
+  // Track dblclick listener for cleanup
+  const dblclickCleanupRef = useRef<(() => void) | null>(null);
+  // Save/restore view state across rebuilds
+  const viewStateRef = useRef<{ scale: number; dx: number; dy: number } | null>(null);
+  // Debounce timer for content changes
+  const rebuildTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Track whether this is a file switch (immediate rebuild) vs content change (debounced)
+  const lastContentFilePathRef = useRef<string | null>(null);
 
   const activeProjectId = useAppStore(s => s.activeProjectId);
   const activeFilePath = useAppStore(s => activeProjectId ? s.activeFilePath[activeProjectId] : null);
@@ -137,6 +148,8 @@ export default function Mindmap({
   });
   const setActiveTab = useAppStore(s => s.setActiveTab);
   const requestSourcePosition = useAppStore(s => s.requestSourcePosition);
+  const pendingMindmapNode = useAppStore(s => s.pendingMindmapNode);
+  const clearMindmapNode = useAppStore(s => s.clearMindmapNode);
 
   const fileName = activeFilePath ? activeFilePath.split(/[/\\]/).pop() || '' : '';
 
@@ -228,6 +241,17 @@ export default function Mindmap({
   const rebuildMindmap = useCallback((content: string, shouldAutoFit: boolean) => {
     if (!containerRef.current) return;
     try {
+      // Save current view state before destroying
+      if (meRef.current) {
+        try {
+          viewStateRef.current = {
+            scale: meRef.current.scaleVal,
+            dx: meRef.current.dx || 0,
+            dy: meRef.current.dy || 0,
+          };
+        } catch { /* ignore */ }
+      }
+
       const ast = parseMarkdown(content);
       astRef.current = ast;
       const mindmapData = mdastToMindmap(ast, fileName);
@@ -296,13 +320,21 @@ export default function Mindmap({
         onSelectNode?.(found);
       });
 
-      // Double click: navigate to source
+      // Double click: navigate to source (use ref for latest selectedNode)
       if (containerRef.current) {
-        containerRef.current.addEventListener('dblclick', () => {
-          if (selectedNode) {
-            goToSource(selectedNode);
+        // Clean up previous listener
+        dblclickCleanupRef.current?.();
+        const container = containerRef.current;
+        const handleDblClick = () => {
+          const node = selectedNodeRef.current;
+          if (node) {
+            goToSource(node);
           }
-        });
+        };
+        container.addEventListener('dblclick', handleDblClick);
+        dblclickCleanupRef.current = () => {
+          container.removeEventListener('dblclick', handleDblClick);
+        };
       }
 
       meRef.current = me;
@@ -310,18 +342,41 @@ export default function Mindmap({
       if (shouldAutoFit) {
         pendingAutoFitFilePathRef.current = activeFilePath || null;
         scheduleFit(activeFilePath || '');
+      } else if (viewStateRef.current) {
+        // Restore previous view state for content updates
+        try {
+          me.scale(viewStateRef.current.scale);
+          me.move(viewStateRef.current.dx, viewStateRef.current.dy);
+        } catch { /* ignore */ }
       }
     } catch (err) {
       pendingAutoFitFilePathRef.current = null;
       console.error('Failed to build mindmap:', err);
       showToast({ type: 'error', message: '脑图构建失败', detail: String(err) });
     }
-  }, [fileName, onMindmapRoot, onSelectNode, scheduleFit, goToSource, activeFilePath, selectedNode]);
+  }, [fileName, onMindmapRoot, onSelectNode, scheduleFit, goToSource, activeFilePath]);
 
   useEffect(() => {
     if (activeFile?.content !== undefined) {
-      const shouldAutoFit = activeFilePath !== lastFittedFilePathRef.current;
-      rebuildMindmap(activeFile.content, shouldAutoFit);
+      const isFileSwitch = activeFilePath !== lastContentFilePathRef.current;
+      lastContentFilePathRef.current = activeFilePath || null;
+
+      if (isFileSwitch) {
+        // File switch: rebuild immediately with auto-fit
+        if (rebuildTimerRef.current) {
+          clearTimeout(rebuildTimerRef.current);
+          rebuildTimerRef.current = null;
+        }
+        const shouldAutoFit = activeFilePath !== lastFittedFilePathRef.current;
+        rebuildMindmap(activeFile.content, shouldAutoFit);
+      } else {
+        // Content change: debounce rebuild to avoid destroying mindmap during typing
+        if (rebuildTimerRef.current) clearTimeout(rebuildTimerRef.current);
+        rebuildTimerRef.current = setTimeout(() => {
+          rebuildTimerRef.current = null;
+          rebuildMindmap(activeFile.content, false);
+        }, 800);
+      }
     }
   }, [activeFile?.content, activeFilePath, rebuildMindmap]);
 
@@ -334,12 +389,57 @@ export default function Mindmap({
       pendingFitFilePathRef.current = null;
       pendingAutoFitFilePathRef.current = null;
       lastFittedFilePathRef.current = null;
+      dblclickCleanupRef.current?.();
+      dblclickCleanupRef.current = null;
+      if (rebuildTimerRef.current) {
+        clearTimeout(rebuildTimerRef.current);
+        rebuildTimerRef.current = null;
+      }
       if (meRef.current) {
         meRef.current.destroy();
         meRef.current = null;
       }
     };
   }, []);
+
+  // Consume pending mindmap node from source editor cursor sync
+  useEffect(() => {
+    if (!pendingMindmapNode || !meRef.current || !mindmapRootRef.current) return;
+    if (pendingMindmapNode.filePath !== activeFilePath) return;
+
+    const targetLine = pendingMindmapNode.line;
+    // Find the mindmap node whose sourcePosition contains this line
+    const findNodeByLine = (node: MindmapNode): MindmapNode | null => {
+      const pos = node.data?.sourcePosition;
+      if (pos && pos.start.line <= targetLine && targetLine <= pos.end.line) {
+        // Check children first for a more specific match
+        if (node.children) {
+          for (const child of node.children) {
+            const found = findNodeByLine(child);
+            if (found) return found;
+          }
+        }
+        return node;
+      }
+      if (node.children) {
+        for (const child of node.children) {
+          const found = findNodeByLine(child);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+
+    const found = findNodeByLine(mindmapRootRef.current);
+    if (found && meRef.current) {
+      try {
+        meRef.current.selectNode(found.id);
+        setSelectedNode(found);
+        onSelectNode?.(found);
+      } catch { /* ignore */ }
+    }
+    clearMindmapNode();
+  }, [pendingMindmapNode, activeFilePath, clearMindmapNode, onSelectNode]);
 
   if (!activeFile) {
     return (

@@ -5,7 +5,6 @@ import { useAppStore } from '../stores/appStore';
 export default function SourceEditor() {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loadingRef = useRef(false);
   const decorationsRef = useRef<string[]>([]);
 
@@ -24,14 +23,19 @@ export default function SourceEditor() {
     activeProjectId: string | null;
     activeFilePath: string | null;
     updateFileContent: (pid: string, fp: string, content: string) => void;
-    saveFile: (pid: string, fp: string) => Promise<boolean>;
+    queueSave: (pid: string, fp: string) => void;
+    requestMindmapNode: (req: { filePath: string; projectId: string; line: number }) => void;
   }>({} as any);
   latestRef.current = {
     activeProjectId,
     activeFilePath,
     updateFileContent: useAppStore.getState().updateFileContent,
-    saveFile: useAppStore.getState().saveFile,
+    queueSave: useAppStore.getState().queueSave,
+    requestMindmapNode: useAppStore.getState().requestMindmapNode,
   };
+
+  // Debounce cursor position changes for mindmap sync
+  const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Create editor
   useEffect(() => {
@@ -55,18 +59,29 @@ export default function SourceEditor() {
     editorRef.current = editor;
 
     const sub = editor.onDidChangeModelContent(() => {
-      const { activeProjectId: pid, activeFilePath: fp, updateFileContent, saveFile } = latestRef.current;
+      const { activeProjectId: pid, activeFilePath: fp, updateFileContent, queueSave } = latestRef.current;
       if (!pid || !fp || loadingRef.current) return;
       updateFileContent(pid, fp, editor.getValue());
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = setTimeout(() => {
-        saveFile(pid, fp);
-      }, 500);
+      // Use store-level debounced save queue instead of component-level timer
+      queueSave(pid, fp);
+    });
+
+    // Listen for cursor position changes to sync with mindmap
+    const cursorSub = editor.onDidChangeCursorPosition((e) => {
+      const { activeProjectId: pid, activeFilePath: fp, requestMindmapNode } = latestRef.current;
+      if (!pid || !fp || loadingRef.current) return;
+      // Debounce cursor changes to avoid excessive mindmap updates
+      if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current);
+      cursorTimerRef.current = setTimeout(() => {
+        cursorTimerRef.current = null;
+        requestMindmapNode({ filePath: fp, projectId: pid, line: e.position.lineNumber });
+      }, 300);
     });
 
     return () => {
       sub.dispose();
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      cursorSub.dispose();
+      if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current);
       editor.dispose();
       editorRef.current = null;
     };

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { useAppStore } from '../stores/appStore';
 import type { FileNode } from '../types';
 
@@ -95,6 +95,32 @@ export default function FileTree() {
   const projects = useAppStore(s => s.projects);
   const project = projects.find(p => p.id === activeProjectId);
   const [collapseSignal, setCollapseSignal] = useState(0);
+  const [filterText, setFilterText] = useState('');
+
+  // Filter file tree based on filterText
+  const filteredTree = useMemo(() => {
+    if (!project || !filterText.trim()) return project?.fileTree || [];
+    const query = filterText.toLowerCase();
+
+    function filterNodes(nodes: FileNode[]): FileNode[] {
+      const result: FileNode[] = [];
+      for (const node of nodes) {
+        if (node.type === 'file') {
+          if (node.name.toLowerCase().includes(query) || node.path.toLowerCase().includes(query)) {
+            result.push(node);
+          }
+        } else if (node.children) {
+          const filteredChildren = filterNodes(node.children);
+          if (filteredChildren.length > 0 || node.name.toLowerCase().includes(query)) {
+            result.push({ ...node, children: filteredChildren });
+          }
+        }
+      }
+      return result;
+    }
+
+    return filterNodes(project.fileTree);
+  }, [project, filterText]);
 
   if (!project) {
     return (
@@ -114,6 +140,23 @@ export default function FileTree() {
         <span style={{ fontWeight: 400 }}>{project.fileTree.length}</span>
       </div>
       <div className="file-tree-toolbar">
+        <input
+          type="text"
+          placeholder="过滤文件..."
+          value={filterText}
+          onChange={e => setFilterText(e.target.value)}
+          style={{
+            flex: 1,
+            background: 'var(--bg-tertiary)',
+            border: '1px solid var(--border)',
+            color: 'var(--text-primary)',
+            padding: '3px 8px',
+            borderRadius: '4px',
+            fontSize: '12px',
+            outline: 'none',
+            marginRight: '4px',
+          }}
+        />
         <button
           className="tree-tool-btn"
           onClick={() => setCollapseSignal(s => s + 1)}
@@ -123,7 +166,7 @@ export default function FileTree() {
         </button>
       </div>
       <div className="file-tree-content">
-        {deduplicateNodes(project.fileTree).map(node => (
+        {deduplicateNodes(filteredTree).map(node => (
           <TreeNode key={node.path} node={node} projectId={project.id} depth={0} collapseSignal={collapseSignal} />
         ))}
       </div>

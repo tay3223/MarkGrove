@@ -6,6 +6,9 @@ import ContentArea from './components/ContentArea';
 import ToastContainer, { showToast } from './components/Toast';
 import ConfirmDialogContainer from './components/ConfirmDialog';
 import QuickOpen from './components/QuickOpen';
+import ConflictDiffPanel from './components/ConflictDiffPanel';
+import SnapshotHistoryPanel from './components/SnapshotHistoryPanel';
+import SearchPanel from './components/SearchPanel';
 
 export default function App() {
   const initialized = useAppStore(s => s.initialized);
@@ -23,6 +26,7 @@ export default function App() {
   const projects = useAppStore(s => s.projects);
 
   const [quickOpenVisible, setQuickOpenVisible] = useState(false);
+  const [searchVisible, setSearchVisible] = useState(false);
 
   // Initialize from session
   useEffect(() => {
@@ -93,6 +97,14 @@ export default function App() {
         e.preventDefault();
         if (activeProjectId) {
           setQuickOpenVisible(true);
+        }
+      }
+
+      // Cmd/Ctrl+Shift+F - Full Text Search
+      if (mod && e.shiftKey && e.key === 'F') {
+        e.preventDefault();
+        if (activeProjectId) {
+          setSearchVisible(true);
         }
       }
     };
@@ -189,6 +201,9 @@ export default function App() {
       <ToastContainer />
       <ConfirmDialogContainer />
       <QuickOpen visible={quickOpenVisible} onClose={() => setQuickOpenVisible(false)} />
+      <ConflictDiffPanel />
+      <SnapshotHistoryPanel />
+      <SearchPanel visible={searchVisible} onClose={() => setSearchVisible(false)} />
     </div>
   );
 }

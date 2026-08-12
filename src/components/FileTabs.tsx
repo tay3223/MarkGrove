@@ -60,34 +60,92 @@ export default function FileTabs() {
   const handleCloseOthers = useCallback(async (keepPath: string) => {
     if (!activeProjectId) return;
     const others = openFiles.filter(f => f.path !== keepPath);
-    for (const f of others) {
-      if (f.isDirty) {
-        const success = await saveFile(activeProjectId, f.path);
-        if (!success) {
+    const dirtyFiles = others.filter(f => f.isDirty);
+
+    // If there are dirty files, ask user what to do
+    if (dirtyFiles.length > 0) {
+      const choice = await choiceDialog({
+        title: '批量关闭',
+        message: `有 ${dirtyFiles.length} 个文件未保存：\n${dirtyFiles.map(f => getFileName(f.path)).join(', ')}\n\n如何处理？`,
+        buttons: [
+          { label: '全部保存并关闭', value: 'save-all', primary: true },
+          { label: '全部不保存', value: 'discard-all', danger: true },
+          { label: '取消', value: 'cancel' },
+        ],
+      });
+      if (choice === 'cancel') return;
+
+      if (choice === 'save-all') {
+        const failed: string[] = [];
+        for (const f of dirtyFiles) {
+          const success = await saveFile(activeProjectId, f.path);
+          if (!success) failed.push(getFileName(f.path));
+        }
+        if (failed.length > 0) {
           showToast({
             type: 'warning',
-            message: `文件 ${getFileName(f.path)} 保存失败，停止批量关闭`,
+            message: `${failed.length} 个文件保存失败`,
+            detail: failed.join(', '),
           });
+          // Close only successfully saved files
+          const savedPaths = new Set(dirtyFiles.filter(f => !failed.includes(getFileName(f.path))).map(f => f.path));
+          for (const f of others) {
+            if (!f.isDirty || savedPaths.has(f.path)) {
+              closeFile(activeProjectId, f.path);
+            }
+          }
           return;
         }
       }
+      // 'discard-all' - close all without saving
+    }
+
+    for (const f of others) {
       closeFile(activeProjectId, f.path);
     }
   }, [activeProjectId, openFiles, saveFile, closeFile]);
 
   const handleCloseAll = useCallback(async () => {
     if (!activeProjectId) return;
-    for (const f of openFiles) {
-      if (f.isDirty) {
-        const success = await saveFile(activeProjectId, f.path);
-        if (!success) {
+    const dirtyFiles = openFiles.filter(f => f.isDirty);
+
+    if (dirtyFiles.length > 0) {
+      const choice = await choiceDialog({
+        title: '关闭全部',
+        message: `有 ${dirtyFiles.length} 个文件未保存：\n${dirtyFiles.map(f => getFileName(f.path)).join(', ')}\n\n如何处理？`,
+        buttons: [
+          { label: '全部保存并关闭', value: 'save-all', primary: true },
+          { label: '全部不保存', value: 'discard-all', danger: true },
+          { label: '取消', value: 'cancel' },
+        ],
+      });
+      if (choice === 'cancel') return;
+
+      if (choice === 'save-all') {
+        const failed: string[] = [];
+        for (const f of dirtyFiles) {
+          const success = await saveFile(activeProjectId, f.path);
+          if (!success) failed.push(getFileName(f.path));
+        }
+        if (failed.length > 0) {
           showToast({
             type: 'warning',
-            message: `文件 ${getFileName(f.path)} 保存失败，停止批量关闭`,
+            message: `${failed.length} 个文件保存失败`,
+            detail: failed.join(', '),
           });
+          // Close only successfully saved files
+          const savedPaths = new Set(dirtyFiles.filter(f => !failed.includes(getFileName(f.path))).map(f => f.path));
+          for (const f of openFiles) {
+            if (!f.isDirty || savedPaths.has(f.path)) {
+              closeFile(activeProjectId, f.path);
+            }
+          }
           return;
         }
       }
+    }
+
+    for (const f of openFiles) {
       closeFile(activeProjectId, f.path);
     }
   }, [activeProjectId, openFiles, saveFile, closeFile]);

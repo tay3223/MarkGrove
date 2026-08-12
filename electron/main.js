@@ -212,19 +212,6 @@ ipcMain.handle('read-file', async (_event, filePath) => {
   }
 });
 
-ipcMain.handle('write-file', async (_event, filePath, content) => {
-  try {
-    if (!isPathInProject(filePath)) {
-      return { error: '文件路径不在已打开的项目目录内' };
-    }
-    markSelfWrite(filePath);
-    await fs.writeFile(filePath, content, 'utf-8');
-    const stat = await fs.stat(filePath);
-    return { success: true, mtime: stat.mtimeMs };
-  } catch (err) {
-    return { error: err.message };
-  }
-});
 
 ipcMain.handle('write-file-atomic', async (_event, filePath, content) => {
   const tmpPath = path.join(
@@ -305,4 +292,53 @@ ipcMain.handle('get-snapshots', () => {
 ipcMain.handle('save-snapshots', (_event, snapshots) => {
   // Keep only the latest 50 snapshots
   snapshotStore.set('snapshots', snapshots.slice(-50));
+});
+
+// Full-text search across project files
+ipcMain.handle('search-in-files', async (_event, projectPath, query) => {
+  if (!isPathInProject(projectPath)) {
+    return { error: '路径不在已打开的项目目录内' };
+  }
+  if (!query || query.length < 2) {
+    return { results: [] };
+  }
+  const results = [];
+  const lowerQuery = query.toLowerCase();
+
+  async function searchDir(dirPath) {
+    try {
+      const entries = await fs.readdir(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (IGNORE_DIRS.has(entry.name)) continue;
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          await searchDir(fullPath);
+        } else if (isMarkdownFile(entry.name)) {
+          try {
+            const content = await fs.readFile(fullPath, 'utf-8');
+            const lines = content.split('\n');
+            const matches = [];
+            for (let i = 0; i < lines.length; i++) {
+              if (lines[i].toLowerCase().includes(lowerQuery)) {
+                // Include context: 1 line before and after
+                const start = Math.max(0, i - 1);
+                const end = Math.min(lines.length - 1, i + 1);
+                matches.push({
+                  line: i + 1,
+                  text: lines[i].trim(),
+                  context: lines.slice(start, end + 1).join('\n'),
+                });
+              }
+            }
+            if (matches.length > 0) {
+              results.push({ filePath: fullPath, matches });
+            }
+          } catch { /* skip unreadable files */ }
+        }
+      }
+    } catch { /* skip unreadable dirs */ }
+  }
+
+  await searchDir(projectPath);
+  return { results };
 });

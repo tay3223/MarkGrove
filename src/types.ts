@@ -23,6 +23,19 @@ export interface OpenFile {
   saveState?: 'saved' | 'saving' | 'error' | 'conflict';
   saveError?: string;
   conflictState?: 'external-modified' | null;
+  /** Content hash for detecting external changes when mtime precision is insufficient */
+  contentHash?: string;
+  /** Conflict details for diff view */
+  conflictDetail?: ConflictDetail | null;
+}
+
+/** Detailed conflict information for diff view */
+export interface ConflictDetail {
+  baseContent: string;
+  localContent: string;
+  externalContent: string;
+  localMtime?: number;
+  externalMtime?: number;
 }
 
 export type ViewTab = 'source' | 'preview' | 'mindmap';
@@ -80,6 +93,9 @@ export interface FileSnapshot {
   filePath: string;
   content: string;
   timestamp: number;
+  projectId?: string;
+  source?: 'auto' | 'conflict-backup' | 'manual';
+  label?: string;
 }
 
 export interface UndoEntry {
@@ -101,6 +117,23 @@ export interface SourcePositionRequest {
   nodeId?: string;
 }
 
+/** Pending mindmap node for source→mindmap navigation */
+export interface MindmapNodeRequest {
+  filePath: string;
+  projectId: string;
+  line: number;
+}
+
+/** Full-text search result */
+export interface SearchResult {
+  filePath: string;
+  matches: Array<{
+    line: number;
+    text: string;
+    context: string;
+  }>;
+}
+
 declare global {
   interface Window {
     api: {
@@ -108,7 +141,6 @@ declare global {
       openFileDialog: () => Promise<string | null>;
       scanDirectory: (path: string) => Promise<FileNode[] | { error: string }>;
       readFile: (path: string) => Promise<{ content?: string; error?: string; mtime?: number }>;
-      writeFile: (path: string, content: string) => Promise<{ success?: boolean; error?: string; mtime?: number }>;
       writeFileAtomic: (path: string, content: string) => Promise<{ success?: boolean; error?: string; mtime?: number }>;
       getFileMtime: (path: string) => Promise<{ mtime?: number; error?: string }>;
       startWatching: (path: string) => Promise<void>;
@@ -120,6 +152,7 @@ declare global {
       getDirName: (path: string) => Promise<string>;
       getSnapshots: () => Promise<FileSnapshot[]>;
       saveSnapshots: (snapshots: FileSnapshot[]) => Promise<void>;
+      searchInFiles: (projectPath: string, query: string) => Promise<{ results?: SearchResult[]; error?: string }>;
       onFileChanged: (callback: (data: FileChangedEvent) => void) => void;
       removeFileChangedListener: () => void;
       onBeforeClose: (callback: () => Promise<boolean>) => void;

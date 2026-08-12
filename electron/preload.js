@@ -5,7 +5,6 @@ contextBridge.exposeInMainWorld('api', {
   openFileDialog: () => ipcRenderer.invoke('open-file-dialog'),
   scanDirectory: (path) => ipcRenderer.invoke('scan-directory', path),
   readFile: (path) => ipcRenderer.invoke('read-file', path),
-  writeFile: (path, content) => ipcRenderer.invoke('write-file', path, content),
   writeFileAtomic: (path, content) => ipcRenderer.invoke('write-file-atomic', path, content),
   getFileMtime: (path) => ipcRenderer.invoke('get-file-mtime', path),
   startWatching: (path) => ipcRenderer.invoke('start-watching', path),
@@ -17,6 +16,7 @@ contextBridge.exposeInMainWorld('api', {
   getDirName: (path) => ipcRenderer.invoke('get-dir-name', path),
   getSnapshots: () => ipcRenderer.invoke('get-snapshots'),
   saveSnapshots: (snapshots) => ipcRenderer.invoke('save-snapshots', snapshots),
+  searchInFiles: (projectPath, query) => ipcRenderer.invoke('search-in-files', projectPath, query),
   onFileChanged: (callback) => {
     ipcRenderer.on('file-changed', (_event, data) => callback(data));
   },

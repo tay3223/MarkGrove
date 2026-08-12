@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 
 export interface DialogButton {
   label: string;
@@ -44,10 +44,10 @@ export default function ConfirmDialogContainer() {
     setVisible(true);
   }, []);
 
-  useState(() => {
+  useEffect(() => {
     showDialogFn = show;
     return () => { showDialogFn = null; };
-  });
+  }, [show]);
 
   const handleResult = (value: any) => {
     setVisible(false);
