@@ -47,7 +47,7 @@ export { parseMarkdown } from './parser';
 export { serializeMarkdown, treesAreEquivalent } from './serializer';
 
 // Projection
-export { projectTree, searchNodes } from './projection';
+export { projectTree, searchNodes, revealSearchPath } from './projection';
 export type { ProjectionOverrides } from './projection';
 
 // Operations
@@ -60,6 +60,7 @@ export {
   resetRuntimeIdCounter,
   computeSemanticKey,
   matchNodes,
+  matchTrees,
   getCapabilities,
   getVisualFamily,
   OccurrenceCounter,

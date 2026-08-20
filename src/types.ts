@@ -40,18 +40,31 @@ export interface ConflictDetail {
 
 export type ViewTab = 'source' | 'preview' | 'mindmap';
 
+export type ProjectionMode = 'structure' | 'balanced' | 'complete';
+
+/** Theme mode (spec 002 §11). Mirrors theme/types.ts to avoid circular imports. */
+export type ThemeMode = 'light' | 'dark' | 'high-contrast';
+
 export interface SessionState {
   projects: Array<{ id: string; name: string; path: string }>;
   activeProjectId: string | null;
   openFiles: Record<string, string[]>;
   activeFiles: Record<string, string | null>;
   activeTab?: ViewTab;
+  /** Persisted projection mode preference (spec 001 §27). */
+  projectionMode?: ProjectionMode;
+  /** Persisted theme ID preference (spec 002 §11.4). */
+  themeId?: string;
+  /** Persisted theme mode preference (spec 002 §11.4). */
+  themeMode?: ThemeMode;
 }
 
 export interface MindmapNode {
   topic: string;
   id: string;
   children?: MindmapNode[];
+  /** Custom HTML for the node (spec 002 §3 NodeContainer slots). */
+  dangerouslySetInnerHTML?: string;
   style?: {
     fontSize?: string;
     fontFamily?: string;

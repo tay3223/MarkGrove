@@ -1,7 +1,9 @@
 import { create } from 'zustand';
-import type { Project, OpenFile, FileNode, ViewTab, SessionState, UndoEntry, FileSnapshot, SourcePositionRequest, ConflictDetail, MindmapNodeRequest } from '../types';
+import type { Project, OpenFile, FileNode, ViewTab, SessionState, UndoEntry, FileSnapshot, SourcePositionRequest, ConflictDetail, MindmapNodeRequest, ProjectionMode, ThemeMode } from '../types';
 import { showToast } from '../components/Toast';
 import { disposeModel, disposeProjectModels } from '../utils/monacoModelRegistry';
+import { switchTheme, initializeDefaultTheme, getRegisteredThemeIds } from '../theme/loader';
+import '../theme/themes/official'; // side-effect: registers all official themes
 
 const MAX_UNDO_STEPS = 50;
 const MAX_SNAPSHOTS = 20;
@@ -40,6 +42,18 @@ interface AppState {
   showConflictDiff: boolean;
   /** The file path currently showing conflict diff */
   conflictDiffFilePath: string | null;
+  /** Current projection mode (spec 001 §27). Switching rebuilds View Tree only. */
+  projectionMode: ProjectionMode;
+  /** Per-file node expansion overrides (spec 001 §27.2: user preference > mode default). */
+  projectionExpanded: Record<string, Set<string>>;
+  /** Per-file node collapse overrides. */
+  projectionCollapsed: Record<string, Set<string>>;
+  /** Per-file force-visible node IDs (e.g. search hits in hidden subtrees). */
+  projectionForceVisible: Record<string, Set<string>>;
+  /** Current theme ID (spec 002 §11.4). Switching only rebuilds CSS variables; never re-parses Markdown. */
+  themeId: string;
+  /** Current theme mode (spec 002 §11). */
+  themeMode: ThemeMode;
 
   initFromSession: () => Promise<void>;
   addProject: () => Promise<void>;
@@ -81,6 +95,18 @@ interface AppState {
   queueSave: (projectId: string, filePath: string) => void;
   /** Flush all pending debounced saves immediately. Returns save results with failed file paths. */
   flushPendingSaves: () => Promise<{ succeeded: number; failed: number; failedPaths: string[] }>;
+  /** Switch projection mode (spec 001 §27). Only rebuilds View Tree; never re-parses Markdown. */
+  setProjectionMode: (mode: ProjectionMode) => void;
+  /** Toggle a node's expanded/collapsed override for the active file (spec 001 §27.2). */
+  toggleNodeExpanded: (filePath: string, nodeId: string, expanded: boolean) => void;
+  /** Mark a node (and its ancestors) force-visible for the active file (search reveal, spec 001 §27.2). */
+  revealNodes: (filePath: string, nodeIds: string[]) => void;
+  /** Clear force-visible overrides for a file (e.g. when search is cleared). */
+  clearRevealedNodes: (filePath: string) => void;
+  /** Clear all projection overrides for a file (called on file close). */
+  clearProjectionOverrides: (filePath: string) => void;
+  /** Switch theme (spec 002 §11.4). Atomic: on failure reverts to previous snapshot. Never re-parses Markdown. */
+  setTheme: (themeId: string, mode: ThemeMode) => void;
 }
 
 function generateId(): string {
@@ -108,6 +134,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   showSnapshotHistory: false,
   showConflictDiff: false,
   conflictDiffFilePath: null,
+  projectionMode: 'balanced',
+  projectionExpanded: {},
+  projectionCollapsed: {},
+  projectionForceVisible: {},
+  themeId: 'official.base',
+  themeMode: 'dark',
 
   initFromSession: async () => {
     try {
@@ -151,8 +183,19 @@ export const useAppStore = create<AppState>((set, get) => ({
           openFiles: {},
           activeFilePath: session.activeFiles || {},
           activeTab: session.activeTab || 'mindmap',
+          projectionMode: session.projectionMode || 'balanced',
           initialized: true,
         });
+        // Restore theme preference (spec 002 §11.4)
+        const restoredThemeId = session.themeId || 'official.base';
+        const restoredThemeMode = session.themeMode || 'dark';
+        const switchResult = switchTheme(restoredThemeId, restoredThemeMode);
+        if (switchResult.success) {
+          set({ themeId: restoredThemeId, themeMode: restoredThemeMode });
+        } else {
+          // Fall back to default theme if the persisted one is invalid
+          initializeDefaultTheme();
+        }
         // Re-open files from session (deduplicate paths)
         const failedFiles: string[] = [];
         for (const [pid, filePaths] of Object.entries(session.openFiles)) {
@@ -174,10 +217,12 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       } else {
         set({ initialized: true });
+        initializeDefaultTheme();
       }
     } catch (err) {
       console.error('Failed to restore session:', err);
       set({ initialized: true });
+      initializeDefaultTheme();
     }
   },
 
@@ -322,6 +367,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   closeFile: (projectId, filePath) => {
     // Dispose Monaco model for the closed file
     disposeModel(projectId, filePath);
+    // Clear projection overrides for the closed file (spec 001 §27.2)
+    get().clearProjectionOverrides(filePath);
     set(s => {
       const files = (s.openFiles[projectId] || []).filter(f => f.path !== filePath);
       const activeFile = s.activeFilePath[projectId] === filePath
@@ -667,6 +714,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       ),
       activeFiles: s.activeFilePath,
       activeTab: s.activeTab,
+      projectionMode: s.projectionMode,
+      themeId: s.themeId,
+      themeMode: s.themeMode,
     };
     try {
       await window.api.saveSession(session);
@@ -969,5 +1019,84 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     // Save all dirty files and return detailed results
     return get().saveAllFiles();
+  },
+
+  setProjectionMode: (mode) => {
+    // Spec 001 §27.2: mode switching must not change Markdown, undo history,
+    // node identity, or manual layout. Only the View Tree is rebuilt.
+    set({ projectionMode: mode });
+    get().saveSession();
+  },
+
+  toggleNodeExpanded: (filePath, nodeId, expanded) => {
+    set(s => {
+      const expandedMap = { ...s.projectionExpanded };
+      const collapsedMap = { ...s.projectionCollapsed };
+      const expSet = new Set(expandedMap[filePath] || []);
+      const colSet = new Set(collapsedMap[filePath] || []);
+      if (expanded) {
+        expSet.add(nodeId);
+        colSet.delete(nodeId);
+      } else {
+        colSet.add(nodeId);
+        expSet.delete(nodeId);
+      }
+      expandedMap[filePath] = expSet;
+      collapsedMap[filePath] = colSet;
+      return { projectionExpanded: expandedMap, projectionCollapsed: collapsedMap };
+    });
+  },
+
+  revealNodes: (filePath, nodeIds) => {
+    if (nodeIds.length === 0) return;
+    set(s => {
+      const forceMap = { ...s.projectionForceVisible };
+      const forceSet = new Set(forceMap[filePath] || []);
+      for (const id of nodeIds) forceSet.add(id);
+      forceMap[filePath] = forceSet;
+      return { projectionForceVisible: forceMap };
+    });
+  },
+
+  clearRevealedNodes: (filePath) => {
+    set(s => {
+      if (!s.projectionForceVisible[filePath]) return s;
+      const forceMap = { ...s.projectionForceVisible };
+      delete forceMap[filePath];
+      return { projectionForceVisible: forceMap };
+    });
+  },
+
+  clearProjectionOverrides: (filePath) => {
+    set(s => {
+      const expandedMap = { ...s.projectionExpanded };
+      const collapsedMap = { ...s.projectionCollapsed };
+      const forceMap = { ...s.projectionForceVisible };
+      delete expandedMap[filePath];
+      delete collapsedMap[filePath];
+      delete forceMap[filePath];
+      return {
+        projectionExpanded: expandedMap,
+        projectionCollapsed: collapsedMap,
+        projectionForceVisible: forceMap,
+      };
+    });
+  },
+
+  setTheme: (themeId, mode) => {
+    // Spec 002 §11.4: theme switching must not re-parse Markdown, rebuild
+    // the semantic tree, or lose node selection/fold/layout state.
+    // switchTheme is atomic: on failure the previous snapshot is preserved.
+    const result = switchTheme(themeId, mode);
+    if (result.success) {
+      set({ themeId, themeMode: mode });
+      get().saveSession();
+    } else {
+      showToast({
+        type: 'warning',
+        message: '主题切换失败，已保留当前主题',
+        detail: result.error || undefined,
+      });
+    }
   },
 }));

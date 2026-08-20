@@ -44,6 +44,7 @@ import {
   getCapabilities,
   OccurrenceCounter,
 } from './identity';
+import { isExtension, getExtension } from './extensions';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Source utilities
@@ -133,7 +134,6 @@ function extractInlineNodes(mdastInline: ReadonlyArray<any> | undefined): Inline
         result.push({ type: 'inlineCode', value: node.value });
         break;
       case 'link':
-      case 'linkReference':
         result.push({
           type: 'link',
           url: node.url || '',
@@ -141,13 +141,33 @@ function extractInlineNodes(mdastInline: ReadonlyArray<any> | undefined): Inline
           children: extractInlineNodes(node.children),
         });
         break;
+      case 'linkReference':
+        // Preserve reference link semantics (spec 001 §18.2): keep identifier,
+        // label and referenceType so the serializer can emit the original form
+        // instead of downgrading to an inline link with an empty URL.
+        result.push({
+          type: 'linkReference',
+          identifier: node.identifier || '',
+          label: node.label ?? null,
+          referenceType: (node.referenceType as 'full' | 'collapsed' | 'shortcut') ?? 'full',
+          children: extractInlineNodes(node.children),
+        });
+        break;
       case 'image':
-      case 'imageReference':
         result.push({
           type: 'image',
           url: node.url || '',
           alt: node.alt || '',
           title: node.title ?? null,
+        });
+        break;
+      case 'imageReference':
+        result.push({
+          type: 'imageReference',
+          identifier: node.identifier || '',
+          label: node.label ?? null,
+          referenceType: (node.referenceType as 'full' | 'collapsed' | 'shortcut') ?? 'full',
+          alt: node.alt || '',
         });
         break;
       case 'break':
@@ -255,7 +275,13 @@ function createNode(
 export function parseMarkdown(source: string, fileName: string): ParseResult {
   const ast = unified()
     .use(remarkParse)
-    .use(remarkFrontmatter, ['yaml'])
+    .use(remarkFrontmatter, [
+      'yaml',
+      'toml',
+      // JSON front matter uses `;;;` fences (spec 001 §18.4: YAML/TOML/JSON).
+      // remark-frontmatter has no `json` preset, so we register a custom matter.
+      { type: 'json', fence: ';;;' },
+    ])
     .use(remarkGfm)
     .parse(source);
 
@@ -314,6 +340,7 @@ export function parseMarkdown(source: string, fileName: string): ParseResult {
     fileName: baseName,
     linkDefinitions: linkDefs,
     footnoteDefinitions: footnoteDefs,
+    fidelityItems: [],
   };
 
   // Process top-level blocks
@@ -382,13 +409,24 @@ function buildTopLevelBlocks(
         processHtml(ctx, block, currentParent(), ancestorKey(), srcRange, source, lineOffsets);
         break;
       case 'yaml':
-        processFrontmatter(ctx, block, root, srcRange, source, lineOffsets);
+        processFrontmatter(ctx, block, root, srcRange, source, lineOffsets, 'yaml');
+        break;
+      case 'toml':
+        processFrontmatter(ctx, block, root, srcRange, source, lineOffsets, 'toml');
+        break;
+      case 'json':
+        processFrontmatter(ctx, block, root, srcRange, source, lineOffsets, 'json');
         break;
       case 'footnoteDefinition':
         processFootnoteDef(ctx, block, currentParent(), ancestorKey(), srcRange, source, lineOffsets);
         break;
       case 'thematicBreak':
-        // Spec 001 §12: thematic breaks don't create nodes, only preserved in source
+        // Spec 001 §12, §18.1: thematic breaks don't create nodes, but must
+        // enter the fidelity layer anchored in source order for lossless
+        // round-trips. Dropping them silently corrupts the document.
+        if (srcRange) {
+          root.fidelityItems.push({ kind: 'thematic-break', source: srcRange });
+        }
         break;
       case 'definition':
         // Already collected as document-level metadata
@@ -471,6 +509,164 @@ function detectHeadingVariant(block: Heading, source: string, lineOffsets: numbe
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Container children builder with local heading stack (spec 001 §20 step 3)
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Extract the first paragraph from a list of blocks as promoted content
+ * (spec 001 §3.1). Returns null if no paragraph is found.
+ */
+function extractPromotedContent(
+  blocks: any[],
+  source: string,
+  lineOffsets: number[],
+): NodeContent | null {
+  for (const block of blocks) {
+    if (block.type === 'paragraph') {
+      return buildContent(extractText(block), block, source, lineOffsets);
+    }
+  }
+  return null;
+}
+
+/**
+ * Build children for a container (list-item, quote, callout) using a local
+ * heading stack (spec 001 §20 step 3, §20.1 rule 3).
+ *
+ * Headings inside a container establish a local section hierarchy scoped to
+ * that container. When the container is left, the outer heading stack is
+ * restored — container headings never pollute the document's global section
+ * attribution.
+ *
+ * If `skipFirstParagraph` is true, the first paragraph encountered is skipped
+ * (it was already promoted as the container's own content per spec 001 §3.1).
+ *
+ * `listNestingDepth` is the nesting depth to use for lists directly inside
+ * this container (1 = top-level list, regardless of the container's tree
+ * depth). Nested lists inside list-items increment this by 1.
+ */
+function buildContainerChildren(
+  ctx: ParseContext,
+  blocks: any[],
+  container: SemanticNode,
+  source: string,
+  lineOffsets: number[],
+  skipFirstParagraph: boolean,
+  listNestingDepth: number,
+): void {
+  let promotedParagraphSkipped = !skipFirstParagraph;
+
+  // Local heading stack (spec 001 §20 step 3, §20.1 rule 3)
+  const localHeadingStack: Array<{ level: number; node: SemanticNode }> = [];
+
+  const localAncestorKey = (): string => {
+    if (localHeadingStack.length === 0) return container.semanticKey;
+    return localHeadingStack[localHeadingStack.length - 1].node.semanticKey;
+  };
+
+  const localParent = (): SemanticNode => {
+    if (localHeadingStack.length > 0) {
+      return localHeadingStack[localHeadingStack.length - 1].node;
+    }
+    return container;
+  };
+
+  for (let i = 0; i < blocks.length; i++) {
+    const sub = blocks[i];
+    const prevSub = i > 0 ? blocks[i - 1] : null;
+    const nextSub = i < blocks.length - 1 ? blocks[i + 1] : null;
+    const prevEndOffset = prevSub?.position?.end?.offset ?? 0;
+    const nextStartOffset = nextSub?.position?.start?.offset ?? null;
+    const subSrc = buildSourceRange(sub, source, lineOffsets, prevEndOffset, nextStartOffset);
+
+    if (sub.type === 'paragraph' && !promotedParagraphSkipped) {
+      // Skip the promoted paragraph (already used as container content)
+      promotedParagraphSkipped = true;
+      continue;
+    }
+
+    switch (sub.type) {
+      case 'heading': {
+        const level = sub.depth as 1 | 2 | 3 | 4 | 5 | 6;
+        // Pop headings of equal or deeper level (local scope)
+        while (
+          localHeadingStack.length > 0 &&
+          localHeadingStack[localHeadingStack.length - 1].level >= level
+        ) {
+          localHeadingStack.pop();
+        }
+        const parent = localParent();
+        const headingNode = makeHeadingNode(
+          ctx, sub, localAncestorKey(), subSrc, source, lineOffsets, parent.depth + 1,
+        );
+        parent.children.push(headingNode);
+        localHeadingStack.push({ level, node: headingNode });
+        break;
+      }
+      case 'list': {
+        const parent = localParent();
+        for (const item of sub.children) {
+          if (item.type !== 'listItem') continue;
+          const itemNode = processListItem(
+            ctx, item, sub, localAncestorKey(), parent.depth + 1, listNestingDepth, source, lineOffsets,
+          );
+          if (itemNode) parent.children.push(itemNode);
+        }
+        break;
+      }
+      case 'blockquote': {
+        const parent = localParent();
+        const quoteNode = makeBlockquoteNode(
+          ctx, sub, localAncestorKey(), subSrc, source, lineOffsets, parent.depth + 1,
+        );
+        parent.children.push(quoteNode);
+        break;
+      }
+      case 'code': {
+        const parent = localParent();
+        const codeNode = makeCodeOrExtensionNode(
+          ctx, sub, localAncestorKey(), subSrc, source, lineOffsets, parent.depth + 1,
+        );
+        parent.children.push(codeNode);
+        break;
+      }
+      case 'table': {
+        const parent = localParent();
+        const tableNode = makeTableNode(
+          ctx, sub, localAncestorKey(), subSrc, source, lineOffsets, parent.depth + 1,
+        );
+        parent.children.push(tableNode);
+        break;
+      }
+      case 'html': {
+        const parent = localParent();
+        const htmlNode = makeHtmlNode(
+          ctx, sub, localAncestorKey(), subSrc, source, lineOffsets, parent.depth + 1,
+        );
+        parent.children.push(htmlNode);
+        break;
+      }
+      case 'paragraph': {
+        const parent = localParent();
+        const paraNode = makeParagraphNode(
+          ctx, sub, localAncestorKey(), subSrc, source, lineOffsets, parent.depth + 1,
+        );
+        parent.children.push(paraNode);
+        break;
+      }
+      default: {
+        const parent = localParent();
+        const unknownNode = makeUnknownNode(
+          ctx, sub, localAncestorKey(), subSrc, source, lineOffsets, parent.depth + 1,
+        );
+        parent.children.push(unknownNode);
+        break;
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // List processing (spec 001 §6)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -483,10 +679,20 @@ function processList(
   source: string,
   lineOffsets: number[],
 ): void {
-  const depth = 1; // top-level list
+  // Tree (display) depth = parent.depth + 1 — derives from the parent, never
+  // a fixed constant (spec 001 §19, §26: `node.depth` is display depth).
+  // List nesting depth = 1 for a top-level list block. Nested lists are
+  // handled recursively: buildContainerChildren receives listNestingDepth + 1,
+  // so each level of indentation increments `syntax.depth` exactly once.
+  // These two depths are distinct (§19): display depth vs list nesting depth
+  // vs heading level never share a constant.
+  const treeDepth = parent.depth + 1;
+  const listNestingDepth = 1;
   for (const item of block.children) {
     if (item.type !== 'listItem') continue;
-    const itemNode = processListItem(ctx, item, block, ancestorKey, depth, source, lineOffsets);
+    const itemNode = processListItem(
+      ctx, item, block, ancestorKey, treeDepth, listNestingDepth, source, lineOffsets,
+    );
     if (itemNode) parent.children.push(itemNode);
   }
 }
@@ -496,7 +702,8 @@ function processListItem(
   item: ListItem,
   list: List,
   ancestorKey: string,
-  depth: number,
+  treeDepth: number,
+  listNestingDepth: number,
   source: string,
   lineOffsets: number[],
 ): SemanticNode | null {
@@ -510,68 +717,18 @@ function processListItem(
   if (item.checked === true) checked = true;
   else if (item.checked === false) checked = 'unchecked';
 
-  // First content promotion (spec 001 §3.1, §6.4):
-  // The first direct paragraph becomes the list item's own content.
-  // Subsequent blocks become children.
   const itemChildren = item.children as any[];
-  let promotedContent: NodeContent | null = null;
-  const childNodes: SemanticNode[] = [];
-  let firstParagraphProcessed = false;
+
+  // Extract promoted content (first paragraph) before creating the node,
+  // so the semanticKey is computed from the real content (spec 001 §3.1, §21)
+  const hasFirstParagraph = itemChildren.some((b: any) => b.type === 'paragraph');
+  const promotedContent = hasFirstParagraph
+    ? extractPromotedContent(itemChildren, source, lineOffsets)
+    : null;
+  const effectiveContent: NodeContent = promotedContent ?? { text: '', inline: null, raw: '' };
 
   // Build source range for this list item
   const itemSrcRange = buildSourceRange(item, source, lineOffsets, 0, null);
-
-  for (const sub of itemChildren) {
-    if (sub.type === 'paragraph' && !firstParagraphProcessed) {
-      // Promote first paragraph as the list item's own content
-      const text = extractText(sub);
-      promotedContent = buildContent(text, sub, source, lineOffsets);
-      firstParagraphProcessed = true;
-    } else if (sub.type === 'list') {
-      // Nested list: recurse with depth + 1
-      for (const nestedItem of sub.children) {
-        if (nestedItem.type !== 'listItem') continue;
-        const nested = processListItem(ctx, nestedItem, sub, ancestorKey, depth + 1, source, lineOffsets);
-        if (nested) childNodes.push(nested);
-      }
-    } else if (sub.type === 'code') {
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const codeNode = makeCodeNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(codeNode);
-    } else if (sub.type === 'blockquote') {
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const quoteNode = makeBlockquoteNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(quoteNode);
-    } else if (sub.type === 'paragraph') {
-      // Subsequent paragraph: create paragraph child
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const paraNode = makeParagraphNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(paraNode);
-    } else if (sub.type === 'table') {
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const tableNode = makeTableNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(tableNode);
-    } else if (sub.type === 'heading') {
-      // Heading inside list item: local scope only (spec 001 §20 step 3)
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const headingNode = makeHeadingNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(headingNode);
-    } else if (sub.type === 'html') {
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const htmlNode = makeHtmlNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(htmlNode);
-    } else {
-      // Unknown sub-block: preserve as-is
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const unknownNode = makeUnknownNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(unknownNode);
-    }
-  }
-
-  // If no content was promoted, use placeholder (spec 001 §3.1)
-  if (!promotedContent) {
-    promotedContent = { text: '', inline: null, raw: '' };
-  }
 
   const syntax: SyntaxMetadata = {
     kind: 'list-item',
@@ -579,22 +736,29 @@ function processListItem(
     ordered,
     start: ordered ? start : undefined,
     checked,
-    depth,
+    depth: listNestingDepth, // list nesting depth (1 = top-level)
   };
 
-  // Use the item's ancestor key for semanticKey
-  const itemAncestorKey = ancestorKey;
-  return createNode(
+  // Create the list-item node first (consumes occurrence, computes semanticKey)
+  const itemNode = createNode(
     ctx,
     'list-item',
     'block-container',
-    promotedContent,
+    effectiveContent,
     syntax,
     itemSrcRange,
-    itemAncestorKey,
-    depth,
-    childNodes,
+    ancestorKey,
+    treeDepth,
+    [],
   );
+
+  // Build children using local heading stack (spec 001 §20 step 3).
+  // Nested lists inside this item get listNestingDepth + 1.
+  buildContainerChildren(
+    ctx, itemChildren, itemNode, source, lineOffsets, hasFirstParagraph, listNestingDepth + 1,
+  );
+
+  return itemNode;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -623,70 +787,36 @@ function makeBlockquoteNode(
   lineOffsets: number[],
   depth: number,
 ): SemanticNode {
-  // First content promotion (spec 001 §3.1, §8):
-  // The first direct paragraph becomes the quote's own content.
   const blockChildren = block.children as any[];
-  let promotedContent: NodeContent | null = null;
-  const childNodes: SemanticNode[] = [];
-  let firstParagraphProcessed = false;
 
-  for (const sub of blockChildren) {
-    if (sub.type === 'paragraph' && !firstParagraphProcessed) {
-      const text = extractText(sub);
-      promotedContent = buildContent(text, sub, source, lineOffsets);
-      firstParagraphProcessed = true;
-    } else if (sub.type === 'blockquote') {
-      // Nested quote: recurse
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const nestedQuote = makeBlockquoteNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(nestedQuote);
-    } else if (sub.type === 'list') {
-      // List inside quote
-      for (const item of sub.children) {
-        if (item.type !== 'listItem') continue;
-        const itemNode = processListItem(ctx, item, sub, ancestorKey, depth + 1, source, lineOffsets);
-        if (itemNode) childNodes.push(itemNode);
-      }
-    } else if (sub.type === 'heading') {
-      // Heading inside quote: local scope only
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const headingNode = makeHeadingNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(headingNode);
-    } else if (sub.type === 'paragraph') {
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const paraNode = makeParagraphNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(paraNode);
-    } else if (sub.type === 'code') {
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const codeNode = makeCodeNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(codeNode);
-    } else if (sub.type === 'table') {
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const tableNode = makeTableNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(tableNode);
-    } else {
-      const subSrc = buildSourceRange(sub, source, lineOffsets, 0, null);
-      const unknownNode = makeUnknownNode(ctx, sub, ancestorKey, subSrc, source, lineOffsets, depth + 1);
-      childNodes.push(unknownNode);
-    }
-  }
+  // Extract promoted content (first paragraph) before creating the node,
+  // so the semanticKey is computed from the real content (spec 001 §3.1, §21)
+  const hasFirstParagraph = blockChildren.some((b: any) => b.type === 'paragraph');
+  const promotedContent = hasFirstParagraph
+    ? extractPromotedContent(blockChildren, source, lineOffsets)
+    : null;
+  const effectiveContent: NodeContent = promotedContent ?? { text: '引用', inline: null, raw: '' };
 
-  if (!promotedContent) {
-    // No promotable content: use placeholder (spec 001 §3.1, §8)
-    promotedContent = { text: '引用', inline: null, raw: '' };
-  }
-
-  return createNode(
+  // Create the quote node first (consumes occurrence, computes semanticKey)
+  const quoteNode = createNode(
     ctx,
     'quote',
     'block-container',
-    promotedContent,
+    effectiveContent,
     { kind: 'none' },
     srcRange,
     ancestorKey,
     depth,
-    childNodes,
+    [],
   );
+
+  // Build children using local heading stack (spec 001 §20 step 3).
+  // Lists inside a quote are top-level (nesting depth 1).
+  buildContainerChildren(
+    ctx, blockChildren, quoteNode, source, lineOffsets, hasFirstParagraph, 1,
+  );
+
+  return quoteNode;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -743,8 +873,14 @@ function makeParagraphNode(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Code processing (spec 001 §9)
+// Code processing (spec 001 §9, §18.4)
 // ─────────────────────────────────────────────────────────────────────────
+
+/** Language identifiers that indicate a math block (spec 001 §18.4). */
+const MATH_LANGS = new Set(['math', 'tex', 'latex', 'katex', 'mathjax']);
+
+/** Language identifiers that indicate a diagram block (spec 001 §18.4). */
+const DIAGRAM_LANGS = new Set(['mermaid', 'plantuml', 'flowchart']);
 
 function processCode(
   ctx: ParseContext,
@@ -755,8 +891,100 @@ function processCode(
   source: string,
   lineOffsets: number[],
 ): void {
-  const codeNode = makeCodeNode(ctx, block, ancestorKey, srcRange, source, lineOffsets, parent.depth + 1);
+  const codeNode = makeCodeOrExtensionNode(ctx, block, ancestorKey, srcRange, source, lineOffsets, parent.depth + 1);
   parent.children.push(codeNode);
+}
+
+/**
+ * Dispatch a code block to the appropriate node type based on its language
+ * (spec 001 §18.4, §20.1 rule 5: explicit extension registration > unknown).
+ *
+ * - Math languages (math, tex, latex, katex, mathjax) → `math` node
+ * - Diagram languages (mermaid, plantuml, flowchart) → `diagram` node
+ * - All other languages → `code` node
+ */
+function makeCodeOrExtensionNode(
+  ctx: ParseContext,
+  block: Code,
+  ancestorKey: string,
+  srcRange: SourceRange | null,
+  source: string,
+  lineOffsets: number[],
+  depth: number,
+): SemanticNode {
+  const lang = (block.lang || '').toLowerCase();
+
+  if (MATH_LANGS.has(lang)) {
+    return makeMathNode(ctx, block, ancestorKey, srcRange, depth);
+  }
+  if (DIAGRAM_LANGS.has(lang)) {
+    return makeDiagramNode(ctx, block, ancestorKey, srcRange, depth, lang);
+  }
+
+  return makeCodeNode(ctx, block, ancestorKey, srcRange, source, lineOffsets, depth);
+}
+
+/** Create a math node from a fenced code block (spec 001 §18.4). */
+function makeMathNode(
+  ctx: ParseContext,
+  block: Code,
+  ancestorKey: string,
+  srcRange: SourceRange | null,
+  depth: number,
+): SemanticNode {
+  const value = block.value || '';
+  const content: NodeContent = {
+    text: value,
+    inline: null,
+    raw: srcRange?.raw ?? value,
+  };
+  const syntax: SyntaxMetadata = {
+    kind: 'math',
+    display: true,
+  };
+  return createNode(
+    ctx,
+    'math',
+    'block-leaf',
+    content,
+    syntax,
+    srcRange,
+    ancestorKey,
+    depth,
+    [],
+  );
+}
+
+/** Create a diagram node from a fenced code block (spec 001 §18.4). */
+function makeDiagramNode(
+  ctx: ParseContext,
+  block: Code,
+  ancestorKey: string,
+  srcRange: SourceRange | null,
+  depth: number,
+  engine: string,
+): SemanticNode {
+  const value = block.value || '';
+  const content: NodeContent = {
+    text: value,
+    inline: null,
+    raw: srcRange?.raw ?? value,
+  };
+  const syntax: SyntaxMetadata = {
+    kind: 'diagram',
+    engine,
+  };
+  return createNode(
+    ctx,
+    'diagram',
+    'block-leaf',
+    content,
+    syntax,
+    srcRange,
+    ancestorKey,
+    depth,
+    [],
+  );
 }
 
 function makeCodeNode(
@@ -979,6 +1207,7 @@ function processFrontmatter(
   srcRange: SourceRange | null,
   source: string,
   lineOffsets: number[],
+  format: 'yaml' | 'toml' | 'json',
 ): void {
   const value = block.value || '';
   const content: NodeContent = {
@@ -989,7 +1218,7 @@ function processFrontmatter(
 
   const syntax: SyntaxMetadata = {
     kind: 'metadata',
-    format: 'yaml',
+    format,
   };
 
   // Front matter is always the first child of root (spec 001 §12)
@@ -1077,7 +1306,7 @@ function makeHeadingNode(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Unknown/extension processing (spec 001 §16, §18.4)
+// Unknown/extension processing (spec 001 §16, §18.4, §20.1 rule 5)
 // ─────────────────────────────────────────────────────────────────────────
 
 function processUnknown(
@@ -1092,12 +1321,23 @@ function processUnknown(
   const node = makeUnknownNode(ctx, block, ancestorKey, srcRange, source, lineOffsets, parent.depth + 1);
   parent.children.push(node);
 
-  ctx.warnings.push({
-    message: `Unknown block type "${block.type}" preserved as unknown node`,
-    source: srcRange,
-  });
+  // Only warn for truly unknown types, not recognized extensions
+  if (node.type === 'unknown') {
+    ctx.warnings.push({
+      message: `Unknown block type "${block.type}" preserved as unknown node`,
+      source: srcRange,
+    });
+  }
 }
 
+/**
+ * Create a node for an unrecognized mdast block.
+ *
+ * Spec 001 §20.1 rule 5: "显式扩展注册高于 unknown 回退" — if the block type
+ * matches a registered extension, create a node with that extension's
+ * SemanticType, role, and capabilities. Otherwise, create an `unknown` node
+ * that preserves the raw source for lossless round-trips (spec 001 §16).
+ */
 function makeUnknownNode(
   ctx: ParseContext,
   block: any,
@@ -1108,6 +1348,30 @@ function makeUnknownNode(
   depth: number,
 ): SemanticNode {
   const rawValue = srcRange?.raw ?? (block.value || JSON.stringify(block));
+
+  // Check if this block type is a registered extension (spec 001 §20.1 rule 5)
+  const extType = block.type as SemanticType;
+  if (isExtension(extType)) {
+    const decl = getExtension(extType)!;
+    const content: NodeContent = {
+      text: block.value || rawValue,
+      inline: null,
+      raw: rawValue,
+    };
+    return createNode(
+      ctx,
+      extType,
+      decl.role,
+      content,
+      { kind: 'extension', extensionType: block.type, raw: rawValue },
+      srcRange,
+      ancestorKey,
+      depth,
+      [],
+    );
+  }
+
+  // Not a registered extension: create unknown node (spec 001 §16)
   const content: NodeContent = {
     text: `[未知] ${block.type}`,
     inline: null,

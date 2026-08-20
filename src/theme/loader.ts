@@ -29,6 +29,14 @@ import { getDefaultTokenMap, getTokenDeclaration, getProtectedTokens } from './t
 
 const themeRegistry = new Map<string, ThemePackage>();
 
+// Supported manifest versions (spec 002 §17): reject themes whose
+// schemaVersion/skeletonVersion this build cannot interpret, rather than
+// silently loading a possibly-incompatible token shape.
+const SUPPORTED_SCHEMA_VERSION = 1;
+const SUPPORTED_SKELETON_VERSION = 1;
+const SUPPORTED_ASSET_FORMATS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'woff', 'woff2', 'ttf', 'otf']);
+const MAX_ASSET_BYTES = 2 * 1024 * 1024; // 2 MB per asset reference (spec 002 §8.3)
+
 /** Register a theme package. */
 export function registerTheme(theme: ThemePackage): void {
   themeRegistry.set(theme.manifest.id, theme);
@@ -113,14 +121,29 @@ export function validateUserOverrides(
     }
 
     // Rule: validate value format and safety
-    const valueError = validateTokenValue(name, decl.type, value);
+    const valueError = validateTokenValue(name, decl.type, value, decl.constraints);
     if (valueError) {
       errors.push({ code: 'INVALID_VALUE', message: valueError, tokenName: name });
     }
 
-    // Rule: no JavaScript injection (spec 002 §13.3)
+    // Rule: no JavaScript/CSS/HTML injection (spec 002 §13.3)
     if (typeof value === 'string') {
-      if (value.includes('javascript:') || value.includes('expression(') || value.includes('<script')) {
+      const lowered = value.toLowerCase();
+      const dangerous = [
+        'javascript:',
+        'expression(',
+        '<script',
+        '</script',
+        '<style',
+        '</style',
+        '<img',
+        '<svg',
+        '<iframe',
+        '<object',
+        '@import',
+        'url(',
+      ];
+      if (dangerous.some(tok => lowered.includes(tok))) {
         errors.push({
           code: 'INJECTION_ATTEMPT',
           message: `Token ${name} contains potentially dangerous content`,
@@ -138,7 +161,12 @@ export function validateUserOverrides(
 }
 
 /** Validate a token value against its type constraints. */
-function validateTokenValue(name: string, type: string, value: string | number): string | null {
+function validateTokenValue(
+  name: string,
+  type: string,
+  value: string | number,
+  constraints: string,
+): string | null {
   switch (type) {
     case 'color':
       if (typeof value !== 'string') return `Token ${name} expects a color string`;
@@ -170,19 +198,56 @@ function validateTokenValue(name: string, type: string, value: string | number):
       return null;
 
     case 'enum':
-      // Enum values are checked against the declaration's constraints
-      return null;
+      // Enum values are checked against the declaration's structured constraint
+      // list (spec 002 §7.7), not by parsing natural language freehand.
+      {
+        const allowed = parseEnumConstraint(constraints);
+        if (allowed && !allowed.includes(String(value))) {
+          return `Token ${name} has invalid enum value: ${value} (allowed: ${allowed.join('|')})`;
+        }
+        return null;
+      }
 
     case 'asset':
-      // Assets must be local or data: URIs (spec 002 §8.3)
+      // Assets must be local or data: URIs (spec 002 §8.3), and must match an
+      // allowed format and size limit.
       if (typeof value === 'string' && value.startsWith('http')) {
         return `Token ${name} cannot reference remote URL: ${value}`;
+      }
+      if (typeof value === 'string') {
+        const fmt = inferAssetFormat(value);
+        if (fmt && !SUPPORTED_ASSET_FORMATS.has(fmt)) {
+          return `Token ${name} has unsupported asset format: ${fmt}`;
+        }
+        if (value.startsWith('data:') && value.length > MAX_ASSET_BYTES) {
+          return `Token ${name} asset exceeds ${MAX_ASSET_BYTES} bytes`;
+        }
       }
       return null;
 
     default:
       return null;
   }
+}
+
+/**
+ * Parse a structured enum constraint string into its allowed values.
+ * Constraints use a pipe-separated list (e.g. "orthogonal|curve|straight") or
+ * the special token "boolean" ("true"|"false"). Returns null for unknown shapes
+ * (treated as unconstrained) to avoid false rejections.
+ */
+function parseEnumConstraint(constraints: string): string[] | null {
+  if (constraints === 'boolean') return ['true', 'false'];
+  const parts = constraints.split('|').map(s => s.trim()).filter(Boolean);
+  if (parts.length >= 2) return parts;
+  // A single value is not a real enum; leaving null avoids over-rejecting.
+  return null;
+}
+
+/** Infer a file extension from an asset/data URI value. */
+function inferAssetFormat(value: string): string | null {
+  const m = /\.([a-z0-9]+)(?:\?|$)/i.exec(value);
+  return m ? m[1].toLowerCase() : null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -205,9 +270,31 @@ export function loadThemeSnapshot(
     return { snapshot: null, error: `Theme not found: ${themeId}` };
   }
 
+  // Validate schemaVersion support range (spec 002 §17).
+  if (theme.manifest.schemaVersion !== SUPPORTED_SCHEMA_VERSION) {
+    return {
+      snapshot: null,
+      error: `Unsupported schemaVersion ${theme.manifest.schemaVersion} (supported: ${SUPPORTED_SCHEMA_VERSION})`,
+    };
+  }
+
+  // Validate skeletonVersion compatibility (spec 002 §17, §11.4).
+  if (theme.manifest.skeletonVersion !== SUPPORTED_SKELETON_VERSION) {
+    return {
+      snapshot: null,
+      error: `Unsupported skeletonVersion ${theme.manifest.skeletonVersion} (supported: ${SUPPORTED_SKELETON_VERSION})`,
+    };
+  }
+
   // Validate mode is supported
   if (!theme.manifest.modes.includes(mode)) {
     return { snapshot: null, error: `Theme ${themeId} does not support mode: ${mode}` };
+  }
+
+  // Validate inheritance chain (missing parent / cycle) before resolving.
+  const chainError = validateInheritanceChain(themeId);
+  if (chainError) {
+    return { snapshot: null, error: chainError };
   }
 
   // Start with system safe defaults
@@ -291,6 +378,31 @@ function resolveInheritanceChain(themeId: string): string[] {
   }
 
   return chain;
+}
+
+/**
+ * Validate the inheritance chain (spec 002 §11.3, §17):
+ *   - every referenced parent theme must exist;
+ *   - no inheritance cycles are allowed.
+ * Returns an error string, or null if the chain is valid.
+ */
+function validateInheritanceChain(themeId: string): string | null {
+  const seen = new Set<string>();
+  let currentId: string | null = themeId;
+
+  while (currentId) {
+    if (seen.has(currentId)) {
+      return `Inheritance cycle detected at theme: ${currentId}`;
+    }
+    seen.add(currentId);
+    const theme = getTheme(currentId);
+    if (!theme) {
+      return `Inherited theme not found: ${currentId}`;
+    }
+    currentId = theme.manifest.inherits;
+  }
+
+  return null;
 }
 
 /** Fill missing tokens with their fallback values. */

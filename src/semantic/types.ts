@@ -199,7 +199,9 @@ export type InlineNode =
   | { type: 'delete'; children: InlineNode[] }
   | { type: 'inlineCode'; value: string }
   | { type: 'link'; url: string; title?: string | null; children: InlineNode[] }
+  | { type: 'linkReference'; identifier: string; label?: string | null; referenceType: 'full' | 'collapsed' | 'shortcut'; children: InlineNode[] }
   | { type: 'image'; url: string; alt: string; title?: string | null }
+  | { type: 'imageReference'; identifier: string; label?: string | null; referenceType: 'full' | 'collapsed' | 'shortcut'; alt: string }
   | { type: 'break' }
   | { type: 'html'; value: string }
   | { type: 'footnoteReference'; identifier: string }
@@ -256,6 +258,11 @@ export interface SemanticRoot extends SemanticNode {
   linkDefinitions: LinkDefinition[];
   /** Document-level footnote definitions in source order. */
   footnoteDefinitions: FootnoteDefinition[];
+  /**
+   * Block-level source items that do not create semantic nodes, preserved in
+   * source order for lossless round-trips (spec 001 §12, §18.1, §22).
+   */
+  fidelityItems: FidelityItem[];
 }
 
 export interface LinkDefinition {
@@ -269,6 +276,18 @@ export interface FootnoteDefinition {
   identifier: string;
   content: string;
   source: SourceRange | null;
+}
+
+/**
+ * A block-level source item that does not create a semantic node, but must be
+ * preserved for lossless round-trips (spec 001 §12, §18.1, §22).
+ *
+ * Such items are anchored in source order relative to sibling blocks so the
+ * serializer can reconstruct the original document layout.
+ */
+export interface FidelityItem {
+  kind: 'thematic-break';
+  source: SourceRange;
 }
 
 // ─────────────────────────────────────────────────────────────────────────

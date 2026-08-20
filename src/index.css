@@ -390,6 +390,196 @@ body {
   color: var(--text-primary);
 }
 
+/* --- NodeContainer Slots (spec 002 §3) --- */
+.mindmap-container .nc-surface {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  position: relative;
+  padding: 2px 4px;
+  outline: none;
+}
+
+/* Focus ring (spec 002 §14): non-color, visible in all modes. */
+.mindmap-container .nc-surface:focus-visible {
+  outline: 2px solid var(--color-state-selected, #89b4fa);
+  outline-offset: 1px;
+}
+
+/* Selected state (spec 002 §6): a left notch plus surface tint — the notch is
+ * a non-color cue so selection is legible even under high contrast. */
+.mindmap-container .nc-surface.nc-selected {
+  background: rgba(137, 180, 250, 0.14);
+}
+.mindmap-container .nc-surface.nc-selected .nc-accent-bar {
+  width: 5px;
+  opacity: 1;
+}
+
+/* Dragging source (spec 002 §6): dim + dashed outline (non-color cue). */
+.mindmap-container .nc-surface.nc-dragging {
+  opacity: 0.5;
+  outline: 2px dashed var(--color-state-selected, #89b4fa);
+  outline-offset: 1px;
+}
+
+/* High contrast / forced-colors: rely on system colors, never color alone
+ * (spec 002 §14 — reduce-motion & forced-colors key states remain legible). */
+@media (forced-colors: active) {
+  .mindmap-container .nc-surface:focus-visible,
+  .mindmap-container .nc-surface.nc-selected,
+  .mindmap-container .nc-surface.nc-dragging {
+    outline: 3px solid Highlight;
+  }
+  .mindmap-container .nc-surface.nc-selected .nc-accent-bar {
+    background: Highlight;
+  }
+}
+
+.mindmap-container .nc-accent-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 2px 0 0 2px;
+  opacity: 0.6;
+}
+
+/* Accent colors per visual family — consume theme tokens (spec 002 §7) */
+.mindmap-container .nc-family-structural .nc-accent-bar { background: var(--color-accent-heading-strong, #89b4fa); }
+.mindmap-container .nc-family-textual .nc-accent-bar { background: var(--color-accent-text, #a6e3a1); }
+.mindmap-container .nc-family-technical .nc-accent-bar { background: var(--color-accent-code, #fab387); }
+.mindmap-container .nc-family-media .nc-accent-bar { background: var(--color-accent-media, #f38ba8); }
+.mindmap-container .nc-family-data .nc-accent-bar { background: var(--color-accent-data, #94e2d5); }
+.mindmap-container .nc-family-notice .nc-accent-bar { background: var(--color-accent-notice, #f9e2af); }
+.mindmap-container .nc-family-fallback .nc-accent-bar { background: var(--color-text-muted, #6c7086); }
+
+.mindmap-container .nc-leading {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.mindmap-container .nc-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.mindmap-container .nc-eyebrow {
+  font-size: 10px;
+  opacity: 0.6;
+  line-height: 1.2;
+}
+
+.mindmap-container .nc-title {
+  line-height: 1.3;
+  word-break: break-word;
+}
+
+.mindmap-container .nc-summary {
+  font-size: 11px;
+  opacity: 0.7;
+  line-height: 1.3;
+  max-height: 40px;
+  overflow: hidden;
+}
+
+.mindmap-container .nc-preview {
+  margin-top: 2px;
+}
+
+.mindmap-container .nc-code-preview {
+  font-family: 'Fira Code', 'SF Mono', Menlo, monospace;
+  font-size: 10px;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 2px 4px;
+  border-radius: 3px;
+  margin: 2px 0;
+  max-height: 60px;
+  overflow: hidden;
+  white-space: pre;
+}
+
+.mindmap-container .nc-table-preview {
+  font-size: 10px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 2px 0;
+}
+
+.mindmap-container .nc-table-headers,
+.mindmap-container .nc-table-row {
+  display: flex;
+  gap: 1px;
+}
+
+.mindmap-container .nc-table-cell {
+  padding: 1px 4px;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mindmap-container .nc-table-headers .nc-table-cell {
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.mindmap-container .nc-image-preview {
+  max-width: 120px;
+  max-height: 60px;
+  border-radius: 3px;
+  object-fit: cover;
+}
+
+.mindmap-container .nc-trailing {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.mindmap-container .nc-indicators {
+  white-space: nowrap;
+}
+
+.mindmap-container .nc-children-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px;
+  font-size: 10px;
+  line-height: 1.4;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: inherit;
+  cursor: pointer;
+  user-select: none;
+}
+
+.mindmap-container .nc-children-toggle:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.mindmap-container .nc-child-count {
+  opacity: 0.7;
+}
+
+.mindmap-container .nc-checkbox {
+  font-size: 12px;
+}
+
 /* --- Source Editor --- */
 .source-editor {
   flex: 1;

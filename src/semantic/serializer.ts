@@ -39,8 +39,32 @@ function serializeInlineNode(node: InlineNode): string {
       return `\`${node.value}\``;
     case 'link':
       return `[${node.children.map(serializeInlineNode).join('')}](${node.url}${node.title ? ` "${node.title}"` : ''})`;
+    case 'linkReference': {
+      const text = node.children.map(serializeInlineNode).join('');
+      // Emit the original reference form (spec 001 §18.2): full `[text][id]`,
+      // collapsed `[text][]`, shortcut `[text]`. This preserves the reference
+      // semantics instead of downgrading to an inline link with an empty URL.
+      if (node.referenceType === 'shortcut') {
+        return `[${text}]`;
+      }
+      if (node.referenceType === 'collapsed') {
+        return `[${text}][]`;
+      }
+      const id = node.label || node.identifier;
+      return `[${text}][${id}]`;
+    }
     case 'image':
       return `![${node.alt}](${node.url}${node.title ? ` "${node.title}"` : ''})`;
+    case 'imageReference': {
+      if (node.referenceType === 'shortcut') {
+        return `![${node.alt}]`;
+      }
+      if (node.referenceType === 'collapsed') {
+        return `![${node.alt}][]`;
+      }
+      const id = node.label || node.identifier;
+      return `![${node.alt}][${id}]`;
+    }
     case 'break':
       return '  \n';
     case 'html':
@@ -215,6 +239,8 @@ function serializeHtml(node: SemanticNode, _ctx: SerializeContext): string {
 }
 
 function serializeMetadata(node: SemanticNode, _ctx: SerializeContext): string {
+  // Prefer the exact original source (includes delimiters) for lossless round-trip
+  if (node.source?.raw) return node.source.raw;
   if (node.syntax.kind === 'metadata') {
     const { format } = node.syntax;
     const delim = format === 'yaml' ? '---' : format === 'toml' ? '+++' : ';;;';
@@ -223,8 +249,15 @@ function serializeMetadata(node: SemanticNode, _ctx: SerializeContext): string {
   return node.content.raw;
 }
 
-function serializeFootnote(node: SemanticNode, ctx: SerializeContext): string {
+function serializeFootnote(node: SemanticNode, _ctx: SerializeContext): string {
+  // The footnote node is the single source of truth for a footnote definition
+  // (spec 001 §12). Serialize the preserved raw source so multi-paragraph and
+  // nested footnote content round-trips losslessly. Never reconstruct from the
+  // display identifier — that would duplicate or corrupt the definition.
   if (node.syntax.kind === 'footnote') {
+    if (node.source && node.source.raw) {
+      return node.source.raw;
+    }
     const { identifier } = node.syntax;
     return `[^${identifier}]: ${node.content.text}`;
   }
@@ -240,11 +273,18 @@ function serializeCallout(node: SemanticNode, ctx: SerializeContext): string {
 }
 
 function serializeMath(node: SemanticNode, _ctx: SerializeContext): string {
-  return `$$\n${node.content.text}\n$$`;
+  // Prefer the exact original source for lossless round-trip
+  if (node.source?.raw) return node.source.raw;
+  // Math blocks are parsed from fenced code with math langs (spec 001 §18.4).
+  // Serialize back as a fenced code block so re-parsing produces the same node.
+  return `\`\`\`math\n${node.content.text}\n\`\`\``;
 }
 
 function serializeDiagram(node: SemanticNode, _ctx: SerializeContext): string {
-  return `\`\`\`${node.syntax.kind === 'diagram' ? node.syntax.engine : 'diagram'}\n${node.content.text}\n\`\`\``;
+  // Prefer the exact original source for lossless round-trip
+  if (node.source?.raw) return node.source.raw;
+  const engine = node.syntax.kind === 'diagram' ? node.syntax.engine : 'mermaid';
+  return `\`\`\`${engine}\n${node.content.text}\n\`\`\``;
 }
 
 function serializeDefinitionItem(node: SemanticNode, ctx: SerializeContext): string {
@@ -263,24 +303,87 @@ function serializeUnknown(node: SemanticNode, _ctx: SerializeContext): string {
 // Root serialization
 // ─────────────────────────────────────────────────────────────────────────
 
-/** Serialize a SemanticRoot back to Markdown source. */
-export function serializeMarkdown(root: SemanticRoot): string {
+/**
+ * Serialize a SemanticRoot back to Markdown source.
+ *
+ * The serializer reconstructs the document by interleaving three kinds of
+ * top-level source items in their original source order (spec 001 §12, §18.1,
+ * §22):
+ *   1. Semantic child nodes (headings, paragraphs, footnote nodes, …)
+ *   2. Fidelity items (thematic breaks) — non-node blocks that must round-trip
+ *   3. Link definitions — document-level metadata serialized at their position
+ *
+ * Footnote definitions are serialized from their footnote node (the single
+ * source of truth, spec 001 §12), never from a separate append, so the same
+ * definition is never emitted twice.
+ */
+/**
+ * Serialize a semantic tree back to Markdown.
+ *
+ * `order` controls how top-level items are laid out (spec 001 §12, §18.1, §22):
+ *   - `'source'` (default): interleave nodes, fidelity items and link
+ *     definitions by their original source offset — used for lossless
+ *     round-trips of unedited documents.
+ *   - `'tree'`: serialize nodes in semantic children order, then append
+ *     fidelity items and link definitions — used by structural operations
+ *     (move/reorder/convert) where the candidate tree's children order has
+ *     diverged from the original source offsets. Fidelity items and link
+ *     definitions are preserved (content-wise) even though their position
+ *     may shift; spec 001 §15.2 allows whitespace/position changes.
+ */
+export function serializeMarkdown(root: SemanticRoot, order: 'source' | 'tree' = 'source'): string {
   const ctx: SerializeContext = { indent: '' };
-  const blocks: string[] = [];
 
-  for (const child of root.children) {
-    const serialized = serializeNode(child, ctx);
-    if (serialized) blocks.push(serialized);
+  if (order === 'tree') {
+    const parts: string[] = [];
+    for (const child of root.children) {
+      const serialized = serializeNode(child, ctx);
+      if (serialized) parts.push(serialized);
+    }
+    for (const item of root.fidelityItems) {
+      if (item.source) parts.push(item.source.raw);
+    }
+    for (const def of root.linkDefinitions) {
+      if (def.source) parts.push(def.source.raw);
+    }
+    return parts.join('\n\n');
   }
 
-  // Append footnote definitions at the end (spec 001 §12)
-  for (const fnDef of root.footnoteDefinitions) {
-    if (fnDef.source) {
-      blocks.push(fnDef.source.raw);
+  interface OrderedItem {
+    offset: number;
+    text: string;
+  }
+  const items: OrderedItem[] = [];
+
+  // 1. Child nodes (includes footnote definition nodes).
+  for (const child of root.children) {
+    const serialized = serializeNode(child, ctx);
+    if (!serialized) continue;
+    // Nodes without a source anchor (e.g. newly added via operations) are
+    // placed after all source-anchored items.
+    const offset = child.source?.start.offset ?? Number.MAX_SAFE_INTEGER;
+    items.push({ offset, text: serialized });
+  }
+
+  // 2. Fidelity items (thematic breaks) — preserved at their source position.
+  for (const item of root.fidelityItems) {
+    if (item.source) {
+      items.push({ offset: item.source.start.offset, text: item.source.raw });
     }
   }
 
-  return blocks.join('\n\n');
+  // 3. Link definitions — document-level metadata, serialized at their
+  //    original source position for lossless round-trips (spec 001 §12).
+  for (const def of root.linkDefinitions) {
+    if (def.source) {
+      items.push({ offset: def.source.start.offset, text: def.source.raw });
+    }
+  }
+
+  // Restore original document order by source offset.
+  items.sort((a, b) => a.offset - b.offset);
+
+  return items.map(i => i.text).join('\n\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -289,12 +392,16 @@ export function serializeMarkdown(root: SemanticRoot): string {
 
 /**
  * Check if two semantic trees are semantically equivalent (spec 001 §25.2).
- * Compares structure, types, content, and syntax — not runtime IDs or source ranges.
+ *
+ * Compares structure, types, content (text + inline), and syntax — not runtime
+ * IDs or source ranges. Inline comparison ensures URLs, identifiers and
+ * reference types are not silently lost (spec 001 §15.1).
  */
 export function treesAreEquivalent(a: SemanticNode, b: SemanticNode): boolean {
   if (a.type !== b.type) return false;
   if (a.role !== b.role) return false;
   if (a.content.text !== b.content.text) return false;
+  if (!inlineNodesEqual(a.content.inline, b.content.inline)) return false;
   if (!syntaxEquals(a.syntax, b.syntax)) return false;
   if (a.children.length !== b.children.length) return false;
   for (let i = 0; i < a.children.length; i++) {
@@ -303,20 +410,68 @@ export function treesAreEquivalent(a: SemanticNode, b: SemanticNode): boolean {
   return true;
 }
 
+/** Compare two inline node arrays for semantic equality (URLs, identifiers, etc.). */
+function inlineNodesEqual(a: ReadonlyArray<InlineNode> | null, b: ReadonlyArray<InlineNode> | null): boolean {
+  if (a === null && b === null) return true;
+  if (a === null || b === null) {
+    // One is null (plain text) and the other is non-null. They are equal only
+    // if the non-null one is effectively plain text (all text nodes).
+    const nonNull = a ?? b;
+    return nonNull!.every(n => n.type === 'text') && nonNull!.map(n => (n as { type: 'text'; value: string }).value).join('') === (a ? (b ?? a)?.map(n => n.type === 'text' ? n.value : '').join('') : (a ?? b)!.map(n => n.type === 'text' ? n.value : '').join(''));
+  }
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!inlineNodeEquals(a[i], b[i])) return false;
+  }
+  return true;
+}
+
+function inlineNodeEquals(a: InlineNode, b: InlineNode): boolean {
+  if (a.type !== b.type) return false;
+  switch (a.type) {
+    case 'text':
+      return a.value === (b as typeof a).value;
+    case 'strong':
+    case 'emphasis':
+    case 'delete':
+      return inlineNodesEqual(a.children, (b as typeof a).children);
+    case 'inlineCode':
+      return a.value === (b as typeof a).value;
+    case 'link':
+      return a.url === (b as typeof a).url && (a.title ?? null) === (b as typeof a).title && inlineNodesEqual(a.children, (b as typeof a).children);
+    case 'linkReference':
+      return a.identifier === (b as typeof a).identifier && a.referenceType === (b as typeof a).referenceType && inlineNodesEqual(a.children, (b as typeof a).children);
+    case 'image':
+      return a.url === (b as typeof a).url && a.alt === (b as typeof a).alt && (a.title ?? null) === (b as typeof a).title;
+    case 'imageReference':
+      return a.identifier === (b as typeof a).identifier && a.referenceType === (b as typeof a).referenceType && a.alt === (b as typeof a).alt;
+    case 'break':
+      return true;
+    case 'html':
+      return a.value === (b as typeof a).value;
+    case 'footnoteReference':
+      return a.identifier === (b as typeof a).identifier;
+    case 'raw':
+      return a.value === (b as typeof a).value;
+    default:
+      return false;
+  }
+}
+
 function syntaxEquals(a: any, b: any): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === 'none' || b.kind === 'none') return a.kind === b.kind;
-  // For heading: compare level and variant
+  // For heading: compare level and variant (atx vs setext matters for fidelity)
   if (a.kind === 'heading' && b.kind === 'heading') {
-    return a.level === b.level;
+    return a.level === b.level && a.variant === b.variant;
   }
-  // For list-item: compare ordered and checked
+  // For list-item: compare ordered, checked, marker and depth
   if (a.kind === 'list-item' && b.kind === 'list-item') {
-    return a.ordered === b.ordered && a.checked === b.checked;
+    return a.ordered === b.ordered && a.checked === b.checked && a.marker === b.marker && a.depth === b.depth;
   }
-  // For code: compare lang
+  // For code: compare lang, fenceChar and fenceLength
   if (a.kind === 'code' && b.kind === 'code') {
-    return a.lang === b.lang;
+    return a.lang === b.lang && a.fenceChar === b.fenceChar && a.fenceLength === b.fenceLength;
   }
   // For others: compare raw text representation
   return JSON.stringify(a) === JSON.stringify(b);

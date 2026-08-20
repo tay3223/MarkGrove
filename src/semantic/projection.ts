@@ -307,3 +307,25 @@ export function searchNodes(
   walk(root, []);
   return results;
 }
+
+/**
+ * Collect node IDs that must be force-visible to reveal search hits.
+ *
+ * Spec 001 §27.2: "搜索命中隐藏节点时，应临时揭示到该节点的展示路径"
+ *
+ * For each search result, the matched node and ALL its ancestors must be
+ * force-visible so the user can navigate to it. Returns a Set of semantic
+ * node IDs suitable for `ProjectionOverrides.forceVisible`.
+ */
+export function revealSearchPath(
+  results: ReadonlyArray<{ node: SemanticNode; path: SemanticNode[] }>,
+): Set<string> {
+  const ids = new Set<string>();
+  for (const result of results) {
+    // The path already includes the node itself as the last element
+    for (const ancestor of result.path) {
+      ids.add(ancestor.id);
+    }
+  }
+  return ids;
+}

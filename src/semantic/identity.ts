@@ -9,7 +9,9 @@
 import type {
   NodeCapabilities,
   SemanticNode,
+  SemanticRoot,
   SemanticType,
+  SourceRange,
   VisualFamily,
 } from './types';
 
@@ -77,6 +79,13 @@ function hashString(s: string): string {
  *
  * This enables incremental rebuilds without losing selection, expansion,
  * or viewport state.
+ *
+ * Matching priority (spec 001 §21):
+ *   1. Exact semanticKey match (type + content + ancestor + occurrence).
+ *   2. Source range overlap (position-based).
+ *   3. Type + content fingerprint (content-based, ignores ancestor).
+ *   4. Same type fallback (positional, weakest).
+ *   5. No match → new identity (implicit; no entry in the map).
  */
 export function matchNodes(
   oldNodes: ReadonlyArray<SemanticNode>,
@@ -84,14 +93,13 @@ export function matchNodes(
 ): Map<string, string> {
   /** Maps new node ID → old node ID (for ID reuse). */
   const matchMap = new Map<string, string>();
+  const usedOld = new Set<string>();
 
-  // Strategy 1: exact semanticKey match
+  // Strategy 1: exact semanticKey match (spec 001 §21 priority 1-3).
   const oldByKey = new Map<string, SemanticNode>();
   for (const old of oldNodes) {
     oldByKey.set(old.semanticKey, old);
   }
-  const usedOld = new Set<string>();
-
   for (const newNode of newNodes) {
     const old = oldByKey.get(newNode.semanticKey);
     if (old && !usedOld.has(old.id)) {
@@ -99,6 +107,103 @@ export function matchNodes(
       usedOld.add(old.id);
     }
   }
+
+  // Strategy 2: source range overlap (spec 001 §21 priority 2).
+  for (const newNode of newNodes) {
+    if (matchMap.has(newNode.id) || !newNode.source) continue;
+    for (const old of oldNodes) {
+      if (usedOld.has(old.id) || !old.source) continue;
+      if (rangesOverlap(newNode.source, old.source)) {
+        matchMap.set(newNode.id, old.id);
+        usedOld.add(old.id);
+        break;
+      }
+    }
+  }
+
+  // Strategy 3: type + content fingerprint (spec 001 §21 priority 3).
+  for (const newNode of newNodes) {
+    if (matchMap.has(newNode.id)) continue;
+    const newNorm = normalizeContent(newNode.content.text);
+    for (const old of oldNodes) {
+      if (usedOld.has(old.id)) continue;
+      if (old.type === newNode.type && normalizeContent(old.content.text) === newNorm) {
+        matchMap.set(newNode.id, old.id);
+        usedOld.add(old.id);
+        break;
+      }
+    }
+  }
+
+  // Strategy 4: same-type positional fallback (spec 001 §21 priority 4).
+  for (const newNode of newNodes) {
+    if (matchMap.has(newNode.id)) continue;
+    for (const old of oldNodes) {
+      if (usedOld.has(old.id)) continue;
+      if (old.type === newNode.type) {
+        matchMap.set(newNode.id, old.id);
+        usedOld.add(old.id);
+        break;
+      }
+    }
+  }
+
+  // Strategy 5: no match → new identity (implicit, no entry in matchMap).
+  return matchMap;
+}
+
+/** Check whether two source ranges overlap. */
+function rangesOverlap(a: SourceRange, b: SourceRange): boolean {
+  return a.start.offset < b.end.offset && b.start.offset < a.end.offset;
+}
+
+/**
+ * Recursively match two semantic trees, returning a map of new node ID → old
+ * node ID for every level of the tree (spec 001 §21, §25.3).
+ *
+ * This is the tree-level entry point: it matches root, then recurses into
+ * children at each matched pair so that descendant matching benefits from
+ * the narrowed context.
+ */
+export function matchTrees(
+  oldRoot: SemanticNode | SemanticRoot,
+  newRoot: SemanticNode | SemanticRoot,
+): Map<string, string> {
+  const matchMap = new Map<string, string>();
+
+  const matchLevel = (
+    oldNodes: ReadonlyArray<SemanticNode>,
+    newNodes: ReadonlyArray<SemanticNode>,
+  ): void => {
+    const levelMap = matchNodes(oldNodes, newNodes);
+    for (const [newId, oldId] of levelMap) {
+      matchMap.set(newId, oldId);
+    }
+    // Recurse into matched children.
+    for (const newNode of newNodes) {
+      const oldId = levelMap.get(newNode.id);
+      if (!oldId) continue;
+      const oldNode = oldNodes.find(n => n.id === oldId);
+      if (oldNode && oldNode.children.length > 0 && newNode.children.length > 0) {
+        matchLevel(oldNode.children, newNode.children);
+      }
+    }
+    // Recurse into unmatched new nodes' children (they may match old nodes
+    // from a different branch that lost their parent).
+    for (const newNode of newNodes) {
+      if (levelMap.has(newNode.id)) continue;
+      if (newNode.children.length === 0) continue;
+      // Try matching against all remaining unmatched old nodes.
+      const remaining = oldNodes.filter(n => !matchMap.has(n.id)).flatMap(n => n.children);
+      if (remaining.length > 0) {
+        matchLevel(remaining, newNode.children);
+      }
+    }
+  };
+
+  // Match roots directly, then recurse.
+  matchMap.set(newRoot.id, oldRoot.id);
+  matchLevel(oldRoot.children, newRoot.children);
 
   return matchMap;
 }

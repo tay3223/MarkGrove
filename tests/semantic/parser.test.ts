@@ -259,6 +259,10 @@ describe('parser — setext headings vs thematic breaks', () => {
     const md = '---\n\n***\n\n___';
     const { root } = parse(md);
     expect(root.children).toHaveLength(0);
+    // Thematic breaks don't create nodes, but must enter the fidelity layer
+    // (spec 001 §12, §18.1) so they round-trip losslessly.
+    expect(root.fidelityItems).toHaveLength(3);
+    expect(root.fidelityItems.every(i => i.kind === 'thematic-break')).toBe(true);
   });
 
   it('distinguishes setext heading from a following thematic break', () => {
@@ -271,9 +275,12 @@ describe('parser — setext headings vs thematic breaks', () => {
     const syn = h.syntax as Extract<SyntaxMetadata, { kind: 'heading' }>;
     expect(syn.variant).toBe('setext');
     expect(syn.level).toBe(1);
-    // Only the "Text" paragraph becomes a child; the thematic break is dropped.
+    // Only the "Text" paragraph becomes a child; the thematic break is not a
+    // node but is preserved in the fidelity layer (spec 001 §12).
     expect(h.children).toHaveLength(1);
     expect(h.children[0].content.text).toBe('Text');
+    expect(root.fidelityItems).toHaveLength(1);
+    expect(root.fidelityItems[0].source.raw).toContain('---');
   });
 });
 
@@ -393,6 +400,39 @@ describe('parser — lists', () => {
       expect(syn.ordered).toBe(false);
       expect(syn.depth).toBe(2);
     }
+  });
+
+  it('keeps display depth, list nesting depth, and heading level distinct (spec §19, §26)', () => {
+    // A heading (level axis), a top-level list item (display depth + nesting
+    // depth both present), and a nested list item (nesting +1) must never
+    // collapse the three axes into one constant.
+    const md = '# Top\n\n- a\n  - b';
+    const { root } = parse(md);
+
+    const heading = root.children[0];
+    expect(heading.type).toBe('heading');
+    const headingSyn = heading.syntax as Extract<SyntaxMetadata, { kind: 'heading' }>;
+    expect(headingSyn.level).toBe(1);   // heading level axis
+    expect(heading.depth).toBe(1);       // display depth axis
+
+    const a = heading.children[0];
+    expect(a.type).toBe('list-item');
+    expect(a.depth).toBe(2);              // display depth = heading.depth + 1
+    const aSyn = a.syntax as Extract<SyntaxMetadata, { kind: 'list-item' }>;
+    expect(aSyn.depth).toBe(1);           // list nesting depth (top-level list)
+
+    const b = a.children[0];
+    expect(b.type).toBe('list-item');
+    expect(b.depth).toBe(3);              // display depth continues from parent
+    const bSyn = b.syntax as Extract<SyntaxMetadata, { kind: 'list-item' }>;
+    expect(bSyn.depth).toBe(2);           // list nesting depth = a.depth + 1
+
+    // The three values (1/2/3) are reached via independent axes, not a
+    // shared constant: heading level stays 1 while display depth is 3 and
+    // nesting depth is 2.
+    expect(headingSyn.level).toBe(1);
+    expect(b.depth).toBe(3);
+    expect(bSyn.depth).toBe(2);
   });
 });
 
@@ -569,8 +609,69 @@ describe('parser — code blocks', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// Quotes (spec 001 §8)
+// Math/Diagram extension detection (spec 001 §18.4, §20.1 rule 5)
 // ─────────────────────────────────────────────────────────────────────────
+
+describe('parser — math and diagram extension detection', () => {
+  it('detects math blocks from code with lang "math"', () => {
+    const md = '```math\nE = mc^2\n```';
+    const { root } = parse(md);
+    expect(root.children).toHaveLength(1);
+    const math = root.children[0];
+    expect(math.type).toBe('math');
+    expect(math.role).toBe('block-leaf');
+    expect(math.content.text).toBe('E = mc^2');
+    const syn = math.syntax as Extract<SyntaxMetadata, { kind: 'math' }>;
+    expect(syn.display).toBe(true);
+  });
+
+  it('detects math blocks from code with lang "tex"', () => {
+    const md = '```tex\n\\frac{1}{2}\n```';
+    const { root } = parse(md);
+    expect(root.children[0].type).toBe('math');
+    expect(root.children[0].content.text).toBe('\\frac{1}{2}');
+  });
+
+  it('detects diagram blocks from code with lang "mermaid"', () => {
+    const md = '```mermaid\ngraph TD\n  A --> B\n```';
+    const { root } = parse(md);
+    expect(root.children).toHaveLength(1);
+    const diag = root.children[0];
+    expect(diag.type).toBe('diagram');
+    expect(diag.role).toBe('block-leaf');
+    expect(diag.content.text).toBe('graph TD\n  A --> B');
+    const syn = diag.syntax as Extract<SyntaxMetadata, { kind: 'diagram' }>;
+    expect(syn.engine).toBe('mermaid');
+  });
+
+  it('detects diagram blocks from code with lang "plantuml"', () => {
+    const md = '```plantuml\n@startuml\nA --> B\n@enduml\n```';
+    const { root } = parse(md);
+    expect(root.children[0].type).toBe('diagram');
+    const syn = root.children[0].syntax as Extract<SyntaxMetadata, { kind: 'diagram' }>;
+    expect(syn.engine).toBe('plantuml');
+  });
+
+  it('does not detect math/diagram from regular code langs', () => {
+    const md = '```javascript\nconst x = 1;\n```';
+    const { root } = parse(md);
+    expect(root.children[0].type).toBe('code');
+  });
+
+  it('math and diagram nodes have correct capabilities from extension registry', () => {
+    const md = '```math\nx^2\n```\n\n```mermaid\nA --> B\n```';
+    const { root } = parse(md);
+    const math = root.children[0];
+    const diag = root.children[1];
+    // Math: movable=true, canHaveChildren=false, convertible=false
+    expect(math.capabilities.movable).toBe(true);
+    expect(math.capabilities.canHaveChildren).toBe(false);
+    expect(math.capabilities.convertible).toBe(false);
+    // Diagram: same capabilities
+    expect(diag.capabilities.movable).toBe(true);
+    expect(diag.capabilities.canHaveChildren).toBe(false);
+  });
+});
 
 describe('parser — quotes', () => {
   it('parses a simple blockquote', () => {
@@ -622,9 +723,13 @@ describe('parser — quotes', () => {
     expect(q.children).toHaveLength(2);
     for (const item of q.children) {
       expect(item.type).toBe('list-item');
+      // Tree depth = quote.depth + 1 = 2 (spec 001 §19: depth from parent)
       expect(item.depth).toBe(2);
       const syn = item.syntax as Extract<SyntaxMetadata, { kind: 'list-item' }>;
-      expect(syn.depth).toBe(2);
+      // List nesting depth = 1 (top-level list inside the quote, not a
+      // nested list). Tree depth and list nesting depth are separate
+      // dimensions per spec 001 §19 and the Phase 3 refactoring plan.
+      expect(syn.depth).toBe(1);
     }
     expect(q.children.map(c => c.content.text)).toEqual(['item1', 'item2']);
   });
@@ -736,6 +841,44 @@ describe('parser — paragraphs and inline syntax', () => {
     expect(p.content.inline).not.toBeNull();
     expect(p.content.inline!.some(n => n.type === 'footnoteReference')).toBe(true);
   });
+
+  it('preserves full reference links as linkReference (not downgraded to link)', () => {
+    const md = '[x][id]\n\n[id]: https://example.com';
+    const { root } = parse(md);
+    const p = root.children[0];
+    expect(p.content.inline).not.toBeNull();
+    const ref = p.content.inline!.find(n => n.type === 'linkReference');
+    expect(ref).toBeDefined();
+    if (ref && ref.type === 'linkReference') {
+      expect(ref.identifier).toBe('id');
+      expect(ref.referenceType).toBe('full');
+    }
+    // Must NOT be downgraded to a plain link with empty URL (P0-2).
+    expect(p.content.inline!.some(n => n.type === 'link')).toBe(false);
+  });
+
+  it('preserves collapsed and shortcut reference links', () => {
+    const md = '[x][]\n\n[x]: https://example.com';
+    const { root } = parse(md);
+    const p = root.children[0];
+    const ref = p.content.inline!.find(n => n.type === 'linkReference');
+    expect(ref).toBeDefined();
+    if (ref && ref.type === 'linkReference') {
+      expect(ref.referenceType).toBe('collapsed');
+    }
+  });
+
+  it('preserves image references as imageReference', () => {
+    const md = '![alt][id]\n\n[id]: https://example.com/img.png';
+    const { root } = parse(md);
+    const p = root.children[0];
+    const ref = p.content.inline!.find(n => n.type === 'imageReference');
+    expect(ref).toBeDefined();
+    if (ref && ref.type === 'imageReference') {
+      expect(ref.identifier).toBe('id');
+      expect(ref.alt).toBe('alt');
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -835,6 +978,32 @@ describe('parser — front matter', () => {
     const { root } = parse(md);
     const meta = root.children[0];
     expect(meta.content.raw).toContain('title: Hi');
+  });
+
+  it('parses TOML front matter as a metadata node with toml format', () => {
+    const md = '+++\ntitle = "Hi"\nauthor = "Sam"\n+++\n\n# Doc';
+    const { root } = parse(md);
+    expect(root.children[0].type).toBe('metadata');
+    const meta = root.children[0];
+    const syn = meta.syntax as Extract<SyntaxMetadata, { kind: 'metadata' }>;
+    expect(syn.format).toBe('toml');
+    expect(meta.content.raw).toContain('title = "Hi"');
+    // The "# Doc" heading comes after.
+    expect(root.children[1].type).toBe('heading');
+    expect(root.children[1].content.text).toBe('Doc');
+  });
+
+  it('parses JSON front matter as a metadata node with json format', () => {
+    const md = ';;;\n{ "title": "Hi", "author": "Sam" }\n;;;\n\n# Doc';
+    const { root } = parse(md);
+    expect(root.children[0].type).toBe('metadata');
+    const meta = root.children[0];
+    const syn = meta.syntax as Extract<SyntaxMetadata, { kind: 'metadata' }>;
+    expect(syn.format).toBe('json');
+    expect(meta.content.raw).toContain('title');
+    // The "# Doc" heading comes after.
+    expect(root.children[1].type).toBe('heading');
+    expect(root.children[1].content.text).toBe('Doc');
   });
 });
 
@@ -1074,32 +1243,93 @@ describe('parser — root attachment and scope', () => {
     expect(H.children.map(c => c.type)).toEqual(['list-item', 'quote']);
     expect(H.children[0].content.text).toBe('item');
     expect(H.children[1].content.text).toBe('quote');
-    // Depth reflects the actual parser behavior: blockquotes use
-    // parent.depth + 1 (= 2), while top-level list items use a fixed
-    // depth of 1 (see processList). Both are children of H regardless.
+    // Both list items and blockquotes use parent.depth + 1 for tree depth
+    // (spec 001 §19: depth derived from parent, no fixed depth assumption).
+    // H is at depth 1, so both children are at depth 2.
+    expect(H.children[0].depth).toBe(2);
     expect(H.children[1].depth).toBe(2);
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// Heading-in-container local scope (spec 001 §20 step 3)
+// Heading-in-container local scope (spec 001 §20 step 3, §20.1 rule 3)
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('parser — heading inside container has local scope', () => {
-  it('heading inside a list item does not capture subsequent list-item content', () => {
-    // The "More text" paragraph should stay a sibling of the heading under
-    // the list item, NOT become a child of the in-item heading.
+  it('heading inside a list item captures subsequent content within the container', () => {
+    // Spec 001 §20 step 3: "容器内部出现的标题默认只在该容器作用域内建树"
+    // The heading establishes a local section tree inside the list item.
+    // "More text" becomes a child of "Sub heading", not a sibling.
+    // The heading's scope is local — it does not pollute the outer document.
     const md = '- item\n  # Sub heading\n  More text';
     const { root } = parse(md);
     const li = root.children[0];
     expect(li.content.text).toBe('item');
-    expect(li.children).toHaveLength(2);
+    // The list item has one child: the heading (which captures "More text")
+    expect(li.children).toHaveLength(1);
     expect(li.children[0].type).toBe('heading');
     expect(li.children[0].content.text).toBe('Sub heading');
-    expect(li.children[1].type).toBe('paragraph');
-    expect(li.children[1].content.text).toBe('More text');
-    // The in-item heading must not have captured the paragraph as its child.
-    expect(li.children[0].children).toHaveLength(0);
+    // "More text" is now a child of the heading, not a sibling
+    expect(li.children[0].children).toHaveLength(1);
+    expect(li.children[0].children[0].type).toBe('paragraph');
+    expect(li.children[0].children[0].content.text).toBe('More text');
+  });
+
+  it('heading inside a list item does not pollute the outer heading stack', () => {
+    // After the list item, the outer heading stack should be restored.
+    // The "# Outer" heading should attach to root, not to the in-item heading.
+    const md = '- item\n  # Sub heading\n  More text\n\n# Outer';
+    const { root } = parse(md);
+    // Root should have 2 children: the list item and the "Outer" heading
+    expect(root.children).toHaveLength(2);
+    expect(root.children[0].type).toBe('list-item');
+    expect(root.children[1].type).toBe('heading');
+    expect(root.children[1].content.text).toBe('Outer');
+    // "Outer" is at depth 1 (top-level heading), not nested under the in-item heading
+    expect(root.children[1].depth).toBe(1);
+  });
+
+  it('multiple headings inside a quote build a local section tree', () => {
+    // Headings inside a quote establish a local hierarchy scoped to the quote.
+    const md = '> # H1 in quote\n> Text under H1\n> ## H2 in quote\n> Text under H2';
+    const { root } = parse(md);
+    const q = root.children[0];
+    expect(q.type).toBe('quote');
+    // The first paragraph "Text under H1" is promoted as quote content
+    expect(q.content.text).toBe('Text under H1');
+    // The quote has one top-level heading child (H1)
+    expect(q.children).toHaveLength(1);
+    const h1 = q.children[0];
+    expect(h1.type).toBe('heading');
+    expect(h1.content.text).toBe('H1 in quote');
+    // H2 is a child of H1 (local heading stack: H2 > H1, so H2 nests under H1)
+    expect(h1.children).toHaveLength(1);
+    const h2 = h1.children[0];
+    expect(h2.type).toBe('heading');
+    expect(h2.content.text).toBe('H2 in quote');
+    // "Text under H2" is a child of H2
+    expect(h2.children).toHaveLength(1);
+    expect(h2.children[0].type).toBe('paragraph');
+    expect(h2.children[0].content.text).toBe('Text under H2');
+  });
+
+  it('headings of equal level inside a container are siblings', () => {
+    // Two H1 headings inside a quote should be siblings, not nested.
+    const md = '> # First\n> Text1\n> # Second\n> Text2';
+    const { root } = parse(md);
+    const q = root.children[0];
+    expect(q.type).toBe('quote');
+    // "Text1" is promoted as quote content
+    expect(q.content.text).toBe('Text1');
+    // Two sibling headings
+    expect(q.children).toHaveLength(2);
+    expect(q.children[0].type).toBe('heading');
+    expect(q.children[0].content.text).toBe('First');
+    expect(q.children[1].type).toBe('heading');
+    expect(q.children[1].content.text).toBe('Second');
+    // "Text2" is a child of "Second"
+    expect(q.children[1].children).toHaveLength(1);
+    expect(q.children[1].children[0].content.text).toBe('Text2');
   });
 });
 

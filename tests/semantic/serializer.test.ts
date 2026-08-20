@@ -582,6 +582,39 @@ describe('serializer round-trip', () => {
       const { tree1, tree2 } = roundTrip(md);
       expect(treesAreEquivalent(tree1, tree2)).toBe(true);
     });
+
+    it('round-trips math blocks preserving type and content', () => {
+      const md = '```math\nE = mc^2\n```';
+      const { tree1, tree2 } = roundTrip(md);
+      expect(tree1.children[0].type).toBe('math');
+      expect(tree2.children[0].type).toBe('math');
+      expect(tree2.children[0].content.text).toBe('E = mc^2');
+      expect(treesAreEquivalent(tree1, tree2)).toBe(true);
+    });
+
+    it('round-trips diagram blocks preserving type and engine', () => {
+      const md = '```mermaid\ngraph TD\n  A --> B\n```';
+      const { tree1, tree2 } = roundTrip(md);
+      expect(tree1.children[0].type).toBe('diagram');
+      expect(tree2.children[0].type).toBe('diagram');
+      expect(treesAreEquivalent(tree1, tree2)).toBe(true);
+    });
+
+    it('round-trips TOML front matter preserving format', () => {
+      const md = '+++\ntitle = "Test"\n+++\n\n# Heading';
+      const { tree1, tree2 } = roundTrip(md);
+      expect(tree1.children[0].type).toBe('metadata');
+      expect(tree2.children[0].type).toBe('metadata');
+      expect(treesAreEquivalent(tree1, tree2)).toBe(true);
+    });
+
+    it('round-trips JSON front matter preserving format', () => {
+      const md = ';;;\n{ "title": "Test", "count": 3 }\n;;;\n\n# Heading';
+      const { tree1, tree2 } = roundTrip(md);
+      expect(tree1.children[0].type).toBe('metadata');
+      expect(tree2.children[0].type).toBe('metadata');
+      expect(treesAreEquivalent(tree1, tree2)).toBe(true);
+    });
   });
 
   // ─── Cross-cutting: treesAreEquivalent semantics ─────────────────────
@@ -643,6 +676,193 @@ describe('serializer round-trip', () => {
       const { root: tree1 } = parseMarkdown('- A\n- B', 'test.md');
       const { root: tree2 } = parseMarkdown('- A', 'test.md');
       expect(treesAreEquivalent(tree1, tree2)).toBe(false);
+    });
+  });
+
+  // ─── 11. P0 lossless source fidelity (spec 001 §12, §18, §22) ────────
+  describe('P0 lossless source fidelity', () => {
+    // P0-1: thematic breaks must not be dropped on round-trip
+    describe('thematic breaks (P0-1)', () => {
+      it('preserves a thematic break between paragraphs', () => {
+        const md = 'A\n\n---\n\nB';
+        const { source2 } = roundTrip(md);
+        expect(source2).toContain('---');
+        expect(source2).toContain('A');
+        expect(source2).toContain('B');
+        // The separator must not be dropped, collapsing A and B.
+        expect(source2).not.toBe('A\n\nB');
+      });
+
+      it('preserves multiple thematic breaks', () => {
+        const md = '---\n\n***\n\n___';
+        const { source2 } = roundTrip(md);
+        expect(source2).toContain('---');
+        expect(source2).toContain('***');
+        expect(source2).toContain('___');
+      });
+
+      it('records thematic breaks in the fidelity layer, not as nodes', () => {
+        const { root } = parseMarkdown('A\n\n---\n\nB', 't.md');
+        // No node is created for the thematic break (spec 001 §12).
+        expect(root.children).toHaveLength(2);
+        expect(root.children.map(c => c.type)).toEqual(['paragraph', 'paragraph']);
+        // But it is preserved in the fidelity layer.
+        expect(root.fidelityItems).toHaveLength(1);
+        expect(root.fidelityItems[0].kind).toBe('thematic-break');
+        expect(root.fidelityItems[0].source.raw).toContain('---');
+      });
+
+      it('is stable across multiple round-trips', () => {
+        const md = 'A\n\n---\n\nB';
+        const { firstTree, finalTree } = multiRoundTrip(md, 4);
+        expect(treesAreEquivalent(firstTree, finalTree)).toBe(true);
+        // Fidelity items survive multiple round-trips.
+        expect(finalTree.fidelityItems).toHaveLength(1);
+      });
+    });
+
+    // P0-2: link definitions and reference links must round-trip
+    describe('link definitions and reference links (P0-2)', () => {
+      it('preserves a link definition at its source position', () => {
+        const md = '[id]: https://example.com "T"\n\nText';
+        const { source2, tree1 } = roundTrip(md);
+        expect(source2).toContain('[id]: https://example.com "T"');
+        expect(tree1.linkDefinitions).toHaveLength(1);
+        expect(tree1.linkDefinitions[0].url).toBe('https://example.com');
+      });
+
+      it('preserves a full reference link without downgrading to empty URL', () => {
+        const md = '[x][id]\n\n[id]: https://example.com "T"';
+        const { source2 } = roundTrip(md);
+        // The reference link must not degrade to [x]().
+        expect(source2).not.toContain('[x](');
+        expect(source2).toContain('[x][id]');
+        expect(source2).toContain('https://example.com');
+      });
+
+      it('preserves a collapsed reference link', () => {
+        const md = '[x][]\n\n[x]: https://example.com';
+        const { source2 } = roundTrip(md);
+        expect(source2).toContain('[x][]');
+        expect(source2).toContain('https://example.com');
+      });
+
+      it('preserves a shortcut reference link', () => {
+        const md = '[x]\n\n[x]: https://example.com';
+        const { source2 } = roundTrip(md);
+        // Shortcut reference: just [x], not [x][] or [x](...)
+        expect(source2).toContain('[x]');
+        expect(source2).not.toContain('[x](');
+        expect(source2).toContain('https://example.com');
+      });
+
+      it('preserves case-sensitive labels in reference links', () => {
+        const md = '[x][ID]\n\n[ID]: https://example.com';
+        const { source2 } = roundTrip(md);
+        // Labels are case-insensitive for matching but original case is preserved.
+        expect(source2).toContain('https://example.com');
+      });
+
+      it('preserves multiple link definitions in source order', () => {
+        const md = '[a]: http://a.com\n[b]: http://b.com "title"\n\nText';
+        const { source2 } = roundTrip(md);
+        expect(source2).toContain('[a]: http://a.com');
+        expect(source2).toContain('[b]: http://b.com "title"');
+        // Both definitions preserved exactly once.
+        expect(source2.match(/http:\/\/a\.com/g)).toHaveLength(1);
+        expect(source2.match(/http:\/\/b\.com/g)).toHaveLength(1);
+      });
+
+      it('preserves an image reference', () => {
+        const md = '![alt][id]\n\n[id]: https://example.com/img.png';
+        const { source2 } = roundTrip(md);
+        expect(source2).toContain('![alt][id]');
+        expect(source2).toContain('https://example.com/img.png');
+      });
+
+      it('is stable across multiple round-trips with reference links', () => {
+        const md = '[x][id]\n\n[id]: https://example.com "T"';
+        const { firstTree, finalTree, finalSource } = multiRoundTrip(md, 4);
+        expect(treesAreEquivalent(firstTree, finalTree)).toBe(true);
+        expect(finalSource).toContain('https://example.com');
+        expect(finalSource).not.toContain('[x]()');
+      });
+    });
+
+    // P0-3: footnote definitions must not be duplicated
+    describe('footnote definitions (P0-3)', () => {
+      it('serializes a footnote definition exactly once', () => {
+        const md = 'Text[^1]\n\n[^1]: Note';
+        const { source2 } = roundTrip(md);
+        // The definition must appear exactly once, not duplicated.
+        expect(source2.match(/\[\^1\]: Note/g)).toHaveLength(1);
+        // The corrupted pseudo-definition [^1]: [^1] must not appear.
+        expect(source2).not.toContain('[^1]: [^1]');
+        expect(source2).toContain('Text[^1]');
+      });
+
+      it('preserves footnote reference and definition together', () => {
+        const md = 'Text[^1]\n\n[^1]: Note';
+        const { source2 } = roundTrip(md);
+        expect(source2).toContain('Text[^1]');
+        expect(source2).toContain('[^1]: Note');
+      });
+
+      it('preserves multiple footnote definitions in source order', () => {
+        const md = '[^1]: first\n\n[^2]: second';
+        const { source2 } = roundTrip(md);
+        expect(source2).toContain('[^1]: first');
+        expect(source2).toContain('[^2]: second');
+        // Each definition exactly once.
+        expect(source2.match(/\[\^1\]: first/g)).toHaveLength(1);
+        expect(source2.match(/\[\^2\]: second/g)).toHaveLength(1);
+      });
+
+      it('keeps the footnote node as single source of truth', () => {
+        const { root } = parseMarkdown('[^1]: Note', 't.md');
+        // The footnote node exists in the tree.
+        expect(root.children).toHaveLength(1);
+        expect(root.children[0].type).toBe('footnote');
+        // The lookup table still exists for reference resolution.
+        expect(root.footnoteDefinitions).toHaveLength(1);
+        // Serializing produces exactly one definition.
+        const source2 = serializeMarkdown(root);
+        expect(source2.match(/\[\^1\]: Note/g)).toHaveLength(1);
+      });
+
+      it('is stable across multiple round-trips', () => {
+        const md = 'Text[^1]\n\n[^1]: Note';
+        const { firstTree, finalTree, finalSource } = multiRoundTrip(md, 4);
+        expect(treesAreEquivalent(firstTree, finalTree)).toBe(true);
+        expect(finalSource.match(/\[\^1\]: Note/g)).toHaveLength(1);
+        expect(finalSource).not.toContain('[^1]: [^1]');
+      });
+    });
+
+    // P0-4: combined fidelity — all non-node source items round-trip together
+    describe('combined fidelity', () => {
+      it('preserves thematic breaks, link defs and footnotes together', () => {
+        const md = [
+          '# Title',
+          '',
+          '---',
+          '',
+          'Paragraph with [ref][id].',
+          '',
+          '[id]: https://example.com',
+          '',
+          'Text[^1]',
+          '',
+          '[^1]: Note',
+        ].join('\n');
+        const { source2 } = roundTrip(md);
+        expect(source2).toContain('---');
+        expect(source2).toContain('[ref][id]');
+        expect(source2).toContain('https://example.com');
+        expect(source2).toContain('[^1]: Note');
+        expect(source2).not.toContain('[^1]: [^1]');
+        expect(source2).not.toContain('[ref](');
+      });
     });
   });
 });

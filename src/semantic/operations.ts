@@ -1,5 +1,5 @@
 /**
- * Tree operations with source-patch-based rewriting (spec 001 §14, §22).
+ * Tree operations with safe writeback transactions (spec 001 §14, §22, §24).
  *
  * Operations:
  *   - addChild (§14.1)
@@ -9,10 +9,21 @@
  *   - reorderSiblings (§14.5)
  *   - convertNode (type conversion)
  *
+ * Safe writeback transaction (spec 001 §22, §24):
+ *   1. Pre-validate the original tree (§24).
+ *   2. Clone and apply the operation to produce a candidate tree + patched source.
+ *   3. Re-parse the patched source into a verification tree.
+ *   4. Validate the re-parsed tree (§24).
+ *   5. Verify the candidate tree is semantically equivalent to the re-parsed tree (§25.2).
+ *   6. On any failure, fall back to full re-serialization; if that also fails,
+ *      atomically return the original tree and source with an error (§24 rule 10).
+ *
  * Source patching (§22):
  *   - Reverse editing prefers source patches: only replace/insert/delete affected blocks
  *   - Only new documents or unrecoverable source positions allow full re-serialization
  *   - On parse failure after patch: revert to pre-edit source (§24 rule 10)
+ *   - Regex must never be used to re-guess Markdown structure; positioning relies on
+ *     the source anchors (SourceRange) already recorded on semantic nodes.
  */
 
 import type {
@@ -23,6 +34,9 @@ import type {
   SyntaxMetadata,
 } from './types';
 import { getCapabilities } from './identity';
+import { parseMarkdown } from './parser';
+import { serializeMarkdown, treesAreEquivalent } from './serializer';
+import { validateTree } from './validate';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Operation types
@@ -87,9 +101,43 @@ function cloneRoot(root: SemanticRoot): SemanticRoot {
     ...root,
     content: { ...root.content },
     children: root.children.map(c => cloneNode(c)),
-    linkDefinitions: [...root.linkDefinitions],
-    footnoteDefinitions: [...root.footnoteDefinitions],
+    linkDefinitions: root.linkDefinitions.map(d => ({ ...d, source: d.source ? { ...d.source } : null })),
+    footnoteDefinitions: root.footnoteDefinitions.map(d => ({ ...d, source: d.source ? { ...d.source } : null })),
+    fidelityItems: root.fidelityItems.map(item => ({ ...item, source: { ...item.source } })),
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Structural jurisdiction (spec 001 §14.3, §22)
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Compute the source offset where a node's structural jurisdiction ends.
+ *
+ * A node's jurisdiction covers its own source range plus the source ranges of
+ * all descendants, because semantic children follow the node in source order
+ * (spec 001 §14.3). Deleting a subtree must remove this entire span, not just
+ * the node's own line.
+ *
+ * Returns -1 when the node carries no source anchor.
+ */
+function getNodeJurisdictionEnd(node: SemanticNode): number {
+  if (!node.source) return -1;
+  let end = node.source.end.offset;
+  for (const child of node.children) {
+    const childEnd = getNodeJurisdictionEnd(child);
+    if (childEnd > end) end = childEnd;
+  }
+  return end;
+}
+
+/**
+ * Compute the [start, end) source span covering a node and all its descendants.
+ * Returns null when the node has no source anchor.
+ */
+function getNodeJurisdictionSpan(node: SemanticNode): { start: number; end: number } | null {
+  if (!node.source) return null;
+  return { start: node.source.start.offset, end: getNodeJurisdictionEnd(node) };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -150,7 +198,15 @@ function createNewNode(
       break;
     }
     case 'list-item':
-      syntax = { kind: 'list-item', marker: '-', ordered: false, depth: 1, checked: undefined };
+      // Nested depth follows parent list-item depth so the serializer emits
+      // the correct indentation (spec 001 §14.1).
+      syntax = {
+        kind: 'list-item',
+        marker: '-',
+        ordered: false,
+        depth: parent.syntax.kind === 'list-item' ? parent.syntax.depth + 1 : 1,
+        checked: undefined,
+      };
       break;
     case 'code':
       syntax = { kind: 'code', fenceChar: '`', fenceLength: 3, lang: '', meta: '' };
@@ -194,21 +250,19 @@ function patchSource(source: string, node: SemanticNode, newText: string): strin
   );
 }
 
-/** Remove a node's source range from the source string. */
-function removeSourceRange(source: string, node: SemanticNode): string {
-  if (!node.source) return source;
-  const start = node.source.start.offset;
-  let end = node.source.end.offset;
-  // Also remove trailing whitespace/newline
+/**
+ * Remove a node's structural jurisdiction (node + all descendants) from the
+ * source string, including trailing blank lines (spec 001 §14.3, §22).
+ */
+function removeJurisdictionFromSource(source: string, node: SemanticNode): string {
+  const span = getNodeJurisdictionSpan(node);
+  if (!span) return source;
+  let end = span.end;
+  // Also consume trailing newlines so we don't leave a dangling blank line.
   while (end < source.length && (source[end] === '\n' || source[end] === '\r')) {
     end++;
   }
-  // Also remove leading whitespace
-  while (start > 0 && source[start - 1] === '\n') {
-    // Don't go past previous block
-    break;
-  }
-  return source.slice(0, start) + source.slice(end);
+  return source.slice(0, span.start) + source.slice(end);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -244,42 +298,199 @@ function serializeNodeForInsertion(node: SemanticNode): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Heading level preview (spec 001 §14.4)
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Preview the heading-level adjustment that would result from moving `node`
+ * under `newParent`. Returns { ok: false, reason } if any heading in the moved
+ * subtree would land outside [1, 6] — in that case the move must be rejected
+ * wholesale and the original source preserved (spec 001 §14.4).
+ */
+function previewHeadingAdjustment(
+  node: SemanticNode,
+  newParent: SemanticNode,
+): { ok: boolean; reason?: string } {
+  if (node.type !== 'heading' || node.syntax.kind !== 'heading') return { ok: true };
+  if (newParent.type !== 'heading' || newParent.syntax.kind !== 'heading') return { ok: true };
+
+  const oldLevel = node.syntax.level;
+  const newLevel = newParent.syntax.level + 1;
+  if (newLevel > 6) {
+    return { ok: false, reason: `Move would push heading to level ${newLevel} (max 6)` };
+  }
+
+  const levelDiff = newLevel - oldLevel;
+  const previewSubtree = (n: SemanticNode): boolean => {
+    if (n.syntax.kind === 'heading') {
+      const adjusted = n.syntax.level + levelDiff;
+      if (adjusted > 6 || adjusted < 1) return false;
+    }
+    return n.children.every(previewSubtree);
+  };
+
+  if (!node.children.every(previewSubtree)) {
+    return { ok: false, reason: 'Move would push a subtree heading out of range [1, 6]' };
+  }
+
+  return { ok: true };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Safe writeback transaction (spec 001 §22, §24)
+// ─────────────────────────────────────────────────────────────────────────
+
+interface VerificationResult {
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * Re-parse `patchedSource`, validate the resulting tree, and verify it is
+ * semantically equivalent to `candidateRoot` (spec 001 §24 rule 9, §25.2).
+ */
+function verifyPatchedSource(
+  originalRoot: SemanticRoot,
+  patchedSource: string,
+  candidateRoot: SemanticRoot,
+): VerificationResult {
+  let reparsedRoot: SemanticRoot;
+  try {
+    const result = parseMarkdown(patchedSource, originalRoot.fileName);
+    reparsedRoot = result.root;
+  } catch (err) {
+    return { ok: false, error: `Reparse failed: ${String(err)}` };
+  }
+
+  const validation = validateTree(reparsedRoot);
+  if (!validation.valid) {
+    return {
+      ok: false,
+      error: `Reparsed tree invalid: ${validation.errors.map(e => e.message).join('; ')}`,
+    };
+  }
+
+  if (!treesAreEquivalent(candidateRoot, reparsedRoot)) {
+    return {
+      ok: false,
+      error: 'Candidate tree not semantically equivalent to reparsed tree',
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Commit a candidate operation result through the safe writeback transaction.
+ *
+ * Strategy (spec 001 §22):
+ *   1. First try the candidate's own `patchedSource` (preferred: minimal patch).
+ *   2. If that fails re-parse or equivalence, fall back to a full re-serialization
+ *      of the candidate tree — this is allowed when source positions are
+ *      unrecoverable (§22) and still guarantees semantic equivalence.
+ *   3. If both fail, atomically return the original root and source with an
+ *      error (§24 rule 10). No half-applied state is ever returned.
+ */
+function commitWithFallback(
+  originalRoot: SemanticRoot,
+  originalSource: string,
+  candidate: OperationResult,
+): OperationResult {
+  // Step 1: try the candidate's patched source (minimal patch preferred).
+  if (candidate.patchedSource !== null) {
+    const result = verifyPatchedSource(originalRoot, candidate.patchedSource, candidate.root);
+    if (result.ok) {
+      return { root: candidate.root, patchedSource: candidate.patchedSource, error: null };
+    }
+    // Minimal patch failed verification — fall through to full re-serialization.
+  }
+
+  // Step 2: fall back to full re-serialization of the candidate tree (§22).
+  // Use 'tree' order so the output reflects the candidate tree's children
+  // order, which may have diverged from the original source offsets.
+  const fallbackSource = serializeMarkdown(candidate.root, 'tree');
+  const fallbackResult = verifyPatchedSource(originalRoot, fallbackSource, candidate.root);
+  if (fallbackResult.ok) {
+    return { root: candidate.root, patchedSource: fallbackSource, error: null };
+  }
+
+  // Step 3: both paths failed — atomically revert (§24 rule 10).
+  return {
+    root: originalRoot,
+    patchedSource: null,
+    error: fallbackResult.error ?? 'Safe writeback transaction failed; original source preserved',
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Apply operation
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
- * Apply a tree operation immutably.
+ * Apply a tree operation immutably through a safe writeback transaction.
  *
- * Returns a new SemanticRoot and optionally a patched source string.
- * The original root is never modified.
+ * Returns a new SemanticRoot and a patched source string. The original root
+ * and source are never modified; on any failure the original root is returned
+ * with an error message (spec 001 §24 rule 10).
  */
 export function applyOperation(
   root: SemanticRoot,
   source: string,
   operation: TreeOperation,
 ): OperationResult {
+  // Step 1: pre-validate the original tree (§24).
+  const preValidation = validateTree(root);
+  if (!preValidation.valid) {
+    return {
+      root,
+      patchedSource: null,
+      error: `Pre-validation failed: ${preValidation.errors.map(e => e.message).join('; ')}`,
+    };
+  }
+
   const newRoot = cloneRoot(root);
 
+  let candidate: OperationResult;
   try {
     switch (operation.kind) {
       case 'addChild':
-        return applyAddChild(newRoot, source, operation);
+        candidate = applyAddChild(newRoot, source, operation);
+        break;
       case 'editNode':
-        return applyEditNode(newRoot, source, operation);
+        candidate = applyEditNode(newRoot, source, operation);
+        break;
       case 'deleteNode':
-        return applyDeleteNode(newRoot, source, operation);
+        candidate = applyDeleteNode(newRoot, source, operation);
+        break;
       case 'moveNode':
-        return applyMoveNode(newRoot, source, operation);
+        candidate = applyMoveNode(newRoot, source, operation);
+        break;
       case 'reorderSiblings':
-        return applyReorderSiblings(newRoot, source, operation);
+        candidate = applyReorderSiblings(newRoot, source, operation);
+        break;
       case 'convertNode':
-        return applyConvertNode(newRoot, source, operation);
+        candidate = applyConvertNode(newRoot, source, operation);
+        break;
       default:
         return { root: newRoot, patchedSource: null, error: 'Unknown operation' };
     }
   } catch (err) {
     return { root, patchedSource: null, error: String(err) };
   }
+
+  // Operation-level error (e.g. node not found, capability denied): return the
+  // original root so callers always receive a pristine tree on failure (§24 rule 10).
+  if (candidate.error) {
+    return { root, patchedSource: null, error: candidate.error };
+  }
+
+  // No patched source (should not happen for committed operations): return as-is.
+  if (candidate.patchedSource === null) {
+    return candidate;
+  }
+
+  // Step 2: commit through the safe writeback transaction.
+  return commitWithFallback(root, source, candidate);
 }
 
 function applyAddChild(
@@ -304,39 +515,44 @@ function applyAddChild(
   const insertIndex = op.index ?? parent.children.length;
   parent.children.splice(insertIndex, 0, newNode);
 
-  // Patch source: append after parent's source range
-  let patchedSource = source;
-  if (parent.source) {
-    const insertionText = serializeNodeForInsertion(newNode);
-    const insertOffset = findInsertionOffset(source, parent, root);
+  // Build a minimal source patch. Positioning relies solely on the source
+  // anchors already recorded on sibling/parent nodes — never on regex guessing.
+  const insertionText = serializeNodeForInsertion(newNode);
+  let insertOffset: number | null = null;
+
+  // Prefer the next sibling's source start (insert before it).
+  if (insertIndex < parent.children.length - 1) {
+    const nextSibling = parent.children[insertIndex + 1];
+    if (nextSibling.source) {
+      insertOffset = nextSibling.source.start.offset;
+    }
+  }
+
+  // Otherwise insert after the previous sibling's jurisdiction end.
+  if (insertOffset === null && insertIndex > 0) {
+    const prevSibling = parent.children[insertIndex - 1];
+    if (prevSibling.source) {
+      insertOffset = getNodeJurisdictionEnd(prevSibling);
+    }
+  }
+
+  // Otherwise fall back to the parent's jurisdiction end.
+  if (insertOffset === null && parent.source) {
+    insertOffset = getNodeJurisdictionEnd(parent);
+  }
+
+  let patchedSource: string;
+  if (insertOffset !== null) {
     patchedSource =
       source.slice(0, insertOffset) +
       insertionText + '\n\n' +
       source.slice(insertOffset);
+  } else {
+    // No usable source anchor (e.g. empty document) — full re-serialization.
+    patchedSource = serializeMarkdown(root);
   }
 
   return { root, patchedSource, error: null };
-}
-
-function findInsertionOffset(source: string, parent: SemanticNode, root: SemanticNode): number {
-  if (!parent.source) return source.length;
-
-  // For headings: insert before the next heading of same or higher level
-  if (parent.type === 'heading' && parent.syntax.kind === 'heading') {
-    const parentLevel = parent.syntax.level;
-    // Find the end of the parent's jurisdiction
-    // Walk the source after parent's end to find the next heading of <= level
-    const searchStart = parent.source.end.offset;
-    const remaining = source.slice(searchStart);
-    const headingRegex = new RegExp(`^(#{1,${parentLevel}})\\s`, 'm');
-    const match = headingRegex.exec(remaining);
-    if (match && match.index !== undefined) {
-      return searchStart + match.index;
-    }
-  }
-
-  // Default: insert after parent's source range
-  return parent.source.end.offset;
 }
 
 function applyEditNode(
@@ -355,16 +571,19 @@ function applyEditNode(
   }
 
   // Preserve syntax metadata, only change text (§14.2)
-  const oldText = node.content.text;
   node.content = { ...node.content, text: op.text };
 
-  // Patch source: replace the node's source range with updated text
-  let patchedSource = source;
+  // Patch source: replace the node's source range with updated text.
+  // The transaction verifier will fall back to full re-serialization if this
+  // minimal patch turns out to be lossy (e.g. for list-items whose source span
+  // also covers nested children).
+  let patchedSource: string;
   if (node.source) {
     const newText = serializeNodeForInsertion(node);
     patchedSource = patchSource(source, node, newText);
-    // Update the raw source
     node.content.raw = newText;
+  } else {
+    patchedSource = serializeMarkdown(root);
   }
 
   return { root, patchedSource, error: null };
@@ -401,13 +620,17 @@ function applyDeleteNode(
       n.children.forEach(c => updateDepth(c, newDepth + 1));
     };
     node.children.forEach(c => updateDepth(c, parent.depth + 1));
-  } else {
-    // Delete entire subtree (§14.3, default)
-    parent.children.splice(index, 1);
+    // Structure changes (indentation, nesting) are complex — use full
+    // re-serialization in tree order; the verifier guarantees semantic equivalence.
+    return { root, patchedSource: serializeMarkdown(root, 'tree'), error: null };
   }
 
-  // Patch source: remove the node's source range
-  const patchedSource = removeSourceRange(source, node);
+  // Delete entire subtree (§14.3, default)
+  parent.children.splice(index, 1);
+
+  // Patch source: remove the node's structural jurisdiction (node + all
+  // descendants), not just the node's own line (P0-4 fix, §14.3).
+  const patchedSource = removeJurisdictionFromSource(source, node);
 
   return { root, patchedSource, error: null };
 }
@@ -445,6 +668,13 @@ function applyMoveNode(
     return { root, patchedSource: null, error: `Target ${newParent.type} cannot have children` };
   }
 
+  // Preview heading-level adjustment; reject wholesale if any heading in the
+  // moved subtree would exceed H6 (spec 001 §14.4).
+  const preview = previewHeadingAdjustment(node, newParent);
+  if (!preview.ok) {
+    return { root, patchedSource: null, error: preview.reason! };
+  }
+
   const oldParent = findParent(root, op.nodeId);
   if (!oldParent) {
     return { root, patchedSource: null, error: `Old parent not found` };
@@ -468,8 +698,10 @@ function applyMoveNode(
   };
   updateDepth(node, newParent.depth + 1);
 
-  // For source patching: full re-serialization is safer for moves
-  return { root, patchedSource: null, error: null };
+  // Moves restructure source blocks significantly; full re-serialization in
+  // tree order is the safe path (§22). The verifier guarantees the result is
+  // semantically equivalent to the candidate tree.
+  return { root, patchedSource: serializeMarkdown(root, 'tree'), error: null };
 }
 
 function adjustNodeForNewParent(node: SemanticNode, newParent: SemanticNode): void {
@@ -477,23 +709,17 @@ function adjustNodeForNewParent(node: SemanticNode, newParent: SemanticNode): vo
   if (node.type === 'heading' && node.syntax.kind === 'heading') {
     if (newParent.type === 'heading' && newParent.syntax.kind === 'heading') {
       const oldLevel = node.syntax.level;
-      const newLevel = Math.min(newParent.syntax.level + 1, 6) as 1 | 2 | 3 | 4 | 5 | 6;
+      const newLevel = newParent.syntax.level + 1;
       const levelDiff = newLevel - oldLevel;
-      node.syntax.level = newLevel;
+      // previewHeadingAdjustment already guaranteed newLevel ≤ 6 and all
+      // subtree headings stay within [1, 6]; clamp here is defensive only.
+      node.syntax.level = Math.min(Math.max(newLevel, 1), 6) as 1 | 2 | 3 | 4 | 5 | 6;
 
       // Adjust subtree heading levels by the same delta (§14.4).
-      // Only children — the moved node itself was already adjusted above.
       const adjustSubtree = (n: SemanticNode) => {
         if (n.syntax.kind === 'heading') {
           const adjusted = n.syntax.level + levelDiff;
-          if (adjusted > 6) {
-            // §14.4: clamp at 6; moves that would exceed 6 should be rejected upstream
-            n.syntax.level = 6;
-          } else if (adjusted < 1) {
-            n.syntax.level = 1;
-          } else {
-            n.syntax.level = adjusted as 1 | 2 | 3 | 4 | 5 | 6;
-          }
+          n.syntax.level = Math.min(Math.max(adjusted, 1), 6) as 1 | 2 | 3 | 4 | 5 | 6;
         }
         n.children.forEach(adjustSubtree);
       };
@@ -533,9 +759,10 @@ function applyReorderSiblings(
   const [moved] = parent.children.splice(fromIndex, 1);
   parent.children.splice(toIndex, 0, moved);
 
-  // Source order follows sibling order (§14.5)
-  // For source patching, full re-serialization is needed for reorder
-  return { root, patchedSource: null, error: null };
+  // Source order follows sibling order (§14.5). Reordering interleaves with
+  // fidelity items and link definitions, so full re-serialization in tree
+  // order is the safe path; the verifier guarantees semantic equivalence.
+  return { root, patchedSource: serializeMarkdown(root, 'tree'), error: null };
 }
 
 function applyConvertNode(
@@ -559,7 +786,6 @@ function applyConvertNode(
 
   // Convert the node type while preserving content (§14.2)
   const oldContent = node.content;
-  const oldCapabilities = node.capabilities;
 
   node.type = op.newType;
   node.capabilities = getCapabilities(op.newType);
@@ -577,12 +803,14 @@ function applyConvertNode(
     case 'paragraph':
       node.syntax = { kind: 'none' };
       node.role = 'block-leaf';
-      // Paragraphs can't have children — lift them (§23)
+      // Paragraphs can't have children — lift them to the grandparent (§23).
+      // The converted node stays in its original position; children follow it
+      // so that source order (and thus re-parse structure) is preserved.
       if (node.children.length > 0) {
         const parent = findParent(root, op.nodeId);
         if (parent) {
           const index = parent.children.indexOf(node);
-          parent.children.splice(index, 1, ...node.children, node);
+          parent.children.splice(index, 1, node, ...node.children);
           node.children = [];
         }
       }
@@ -599,5 +827,7 @@ function applyConvertNode(
 
   node.content = oldContent;
 
-  return { root, patchedSource: null, error: null };
+  // Type conversion changes syntax markers; full re-serialization in tree
+  // order is the safe path; the verifier guarantees semantic equivalence.
+  return { root, patchedSource: serializeMarkdown(root, 'tree'), error: null };
 }
